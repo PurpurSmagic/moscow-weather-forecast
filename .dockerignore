@@ -1,0 +1,15 @@
+.git
+.gitignore
+.gitattributes
+.env
+.venv
+venv
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.ruff_cache
+.idea
+.vscode
+data
+*.bundle
+docs
