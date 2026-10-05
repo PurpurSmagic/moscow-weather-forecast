@@ -65,6 +65,51 @@ class HeatingRule:
 
 
 @dataclass(frozen=True)
+class HttpSettings:
+    timeout_s: float = 60
+    max_attempts: int = 5
+    backoff_base_s: float = 2
+    backoff_max_s: float = 60
+    min_interval_s: float = 1.0
+    user_agent: str = "moscow-weather-forecast"
+
+
+@dataclass(frozen=True)
+class OpenMeteoArchiveSource:
+    enabled: bool
+    url: str
+    daily_variables: tuple[str, ...]
+    overlap_days: int
+    min_interval_s: float
+
+
+@dataclass(frozen=True)
+class OpenMeteoForecastSource:
+    enabled: bool
+    url: str
+    daily_variables: tuple[str, ...]
+    forecast_days: int
+    min_interval_s: float
+
+
+@dataclass(frozen=True)
+class MeteostatSource:
+    enabled: bool
+    url_template: str
+    station_id: str
+    overlap_days: int
+    required_columns: tuple[str, ...]
+    min_interval_s: float
+
+
+@dataclass(frozen=True)
+class SourcesSettings:
+    openmeteo_archive: OpenMeteoArchiveSource
+    openmeteo_forecast: OpenMeteoForecastSource
+    meteostat_daily: MeteostatSource
+
+
+@dataclass(frozen=True)
 class Settings:
     db: DatabaseSettings
     station: StationSettings
@@ -74,6 +119,8 @@ class Settings:
     forecast_horizon_days: int
     heating: HeatingRule
     ice_threshold_c: float
+    http: HttpSettings
+    sources: SourcesSettings
     log_level: str
     config_path: Path
     # Полное содержимое YAML — для разделов, которые появятся на следующих этапах
@@ -114,6 +161,8 @@ def load_settings(
                 "decision_rules.ice_risk",
             )
         ),
+        http=_http_settings(_section(data, "http")),
+        sources=_sources_settings(_section(data, "sources")),
         log_level=_log_level(environ),
         config_path=path,
         raw=data,
@@ -232,3 +281,88 @@ def _heating_rule(section: Mapping[str, Any]) -> HeatingRule:
         threshold_c=float(_require(section, "threshold_c", where)),
         consecutive_days=_int_in_range(section, "consecutive_days", where, 1, 30),
     )
+
+
+# --- HTTP и источники данных -----------------------------------------------------
+
+
+def _http_settings(section: Mapping[str, Any]) -> HttpSettings:
+    where = "http"
+    return HttpSettings(
+        timeout_s=_float_in_range(section, "timeout_s", where, 1, 600),
+        max_attempts=_int_in_range(section, "max_attempts", where, 1, 10),
+        backoff_base_s=_float_in_range(section, "backoff_base_s", where, 0, 60),
+        backoff_max_s=_float_in_range(section, "backoff_max_s", where, 0, 600),
+        min_interval_s=_float_in_range(section, "min_interval_s", where, 0, 60),
+        user_agent=str(_require(section, "user_agent", where)),
+    )
+
+
+def _sources_settings(section: Mapping[str, Any]) -> SourcesSettings:
+    archive = _section(section, "openmeteo_archive")
+    forecast = _section(section, "openmeteo_forecast")
+    meteostat = _section(section, "meteostat_daily")
+    return SourcesSettings(
+        openmeteo_archive=OpenMeteoArchiveSource(
+            enabled=_bool(archive, "enabled", "sources.openmeteo_archive"),
+            url=_url(archive, "url", "sources.openmeteo_archive"),
+            daily_variables=_variables(archive, "sources.openmeteo_archive"),
+            overlap_days=_int_in_range(archive, "overlap_days", "sources.openmeteo_archive", 0, 60),
+            min_interval_s=_float_in_range(archive, "min_interval_s", "sources.openmeteo_archive", 0, 60),
+        ),
+        openmeteo_forecast=OpenMeteoForecastSource(
+            enabled=_bool(forecast, "enabled", "sources.openmeteo_forecast"),
+            url=_url(forecast, "url", "sources.openmeteo_forecast"),
+            daily_variables=_variables(forecast, "sources.openmeteo_forecast"),
+            forecast_days=_int_in_range(forecast, "forecast_days", "sources.openmeteo_forecast", 2, 16),
+            min_interval_s=_float_in_range(forecast, "min_interval_s", "sources.openmeteo_forecast", 0, 60),
+        ),
+        meteostat_daily=MeteostatSource(
+            enabled=_bool(meteostat, "enabled", "sources.meteostat_daily"),
+            url_template=_url_template(meteostat, "sources.meteostat_daily"),
+            station_id=str(_require(meteostat, "station_id", "sources.meteostat_daily")),
+            overlap_days=_int_in_range(meteostat, "overlap_days", "sources.meteostat_daily", 0, 366),
+            required_columns=_str_list(meteostat, "required_columns", "sources.meteostat_daily"),
+            min_interval_s=_float_in_range(meteostat, "min_interval_s", "sources.meteostat_daily", 0, 60),
+        ),
+    )
+
+
+def _bool(section: Mapping[str, Any], key: str, where: str) -> bool:
+    value = _require(section, key, where)
+    if not isinstance(value, bool):
+        raise ConfigError(f"{where}.{key} должен быть true или false, получено: {value!r}")
+    return value
+
+
+def _url(section: Mapping[str, Any], key: str, where: str) -> str:
+    value = str(_require(section, key, where))
+    if not value.startswith("https://"):
+        raise ConfigError(f"{where}.{key} должен начинаться с https://, получено: {value!r}")
+    return value
+
+
+def _url_template(section: Mapping[str, Any], where: str) -> str:
+    value = _url(section, "url_template", where)
+    for placeholder in ("{year}", "{station}"):
+        if placeholder not in value:
+            raise ConfigError(f"{where}.url_template должен содержать {placeholder}")
+    return value
+
+
+def _str_list(section: Mapping[str, Any], key: str, where: str) -> tuple[str, ...]:
+    value = _require(section, key, where)
+    if not isinstance(value, list) or not value or not all(isinstance(v, str) and v for v in value):
+        raise ConfigError(f"{where}.{key} должен быть непустым списком строк")
+    if len(set(value)) != len(value):
+        raise ConfigError(f"{where}.{key} содержит повторяющиеся значения")
+    return tuple(value)
+
+
+def _variables(section: Mapping[str, Any], where: str) -> tuple[str, ...]:
+    variables = _str_list(section, "daily_variables", where)
+    if "temperature_2m_mean" not in variables:
+        raise ConfigError(
+            f"{where}.daily_variables должен включать temperature_2m_mean — это целевой показатель"
+        )
+    return variables

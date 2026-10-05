@@ -35,3 +35,84 @@ decision_rules:
   ice_risk:
     # Переход температуры через 0 °C — риск гололёда
     threshold_c: 0.0
+
+# HTTP-клиент: таймауты, повторы при сбоях, ограничение частоты запросов
+http:
+  timeout_s: 60
+  # Всего попыток на один запрос. Повторяются таймауты, обрывы, HTTP 429 и 5xx
+  max_attempts: 5
+  # Пауза перед повтором растёт: 2, 4, 8, 16… с, но не больше backoff_max_s
+  backoff_base_s: 2
+  backoff_max_s: 60
+  # Минимальный интервал между запросами к источнику, если у источника не задан свой
+  min_interval_s: 1.0
+  user_agent: "moscow-weather-forecast/0.2 (student project)"
+
+# Источники данных
+sources:
+  # Open-Meteo Historical Weather API — история с 1940 года (JSON).
+  # Свежие дни сначала приходят из оперативной модели и позже уточняются реанализом ERA5.
+  openmeteo_archive:
+    enabled: true
+    url: https://archive-api.open-meteo.com/v1/archive
+    # Сколько последних уже загруженных дней перезапрашивать, чтобы забрать уточнения
+    overlap_days: 10
+    # История запрашивается порциями по календарным годам. Open-Meteo считает запрос
+    # за >10 переменных или >2 недель как несколько «вызовов» (лимит 600 в минуту),
+    # поэтому между порциями пауза (~55 «вызовов» на год данных → не больше ~330 в минуту)
+    min_interval_s: 10
+    daily_variables:
+      - weather_code
+      - temperature_2m_mean
+      - temperature_2m_max
+      - temperature_2m_min
+      - apparent_temperature_mean
+      - precipitation_sum
+      - rain_sum
+      - snowfall_sum
+      - precipitation_hours
+      - wind_speed_10m_max
+      - wind_gusts_10m_max
+      - wind_direction_10m_dominant
+      - shortwave_radiation_sum
+      - relative_humidity_2m_mean
+      - pressure_msl_mean
+      - cloud_cover_mean
+      - dew_point_2m_mean
+      - snow_depth_max
+
+  # Open-Meteo Forecast API — прогноз на 7 суток (JSON). Снимок сохраняется раз в сутки:
+  # так копится архив прогнозов для сравнения с собственными моделями
+  openmeteo_forecast:
+    enabled: true
+    url: https://api.open-meteo.com/v1/forecast
+    # Сегодня + 7 суток
+    forecast_days: 8
+    min_interval_s: 1
+    daily_variables:
+      - weather_code
+      - temperature_2m_mean
+      - temperature_2m_max
+      - temperature_2m_min
+      - precipitation_sum
+      - rain_sum
+      - snowfall_sum
+      - precipitation_probability_max
+      - wind_speed_10m_max
+      - wind_gusts_10m_max
+      - wind_direction_10m_dominant
+      - relative_humidity_2m_mean
+      - pressure_msl_mean
+      - cloud_cover_mean
+
+  # Meteostat Bulk Data — суточные данные станции, один сжатый CSV на год
+  meteostat_daily:
+    enabled: true
+    url_template: https://data.meteostat.net/daily/{year}/{station}.csv.gz
+    station_id: "27612"
+    # Файлы за годы, попадающие в это окно от отметки загрузки, проверяются заново
+    # (условным запросом по ETag — неизменённый файл не скачивается)
+    overlap_days: 30
+    min_interval_s: 1
+    # Без этих колонок файл считается некорректным
+    required_columns: [year, month, day, temp, tmin, tmax, prcp]

@@ -37,7 +37,7 @@ services:
     volumes:
       # Настройки можно менять без пересборки образа
       - ./config:/app/config:ro
-    command: ["sh", "-c", "python -m weather migrate && python -m weather check"]
+    command: ["python", "-m", "weather", "run"]
 
 volumes:
   pgdata:
