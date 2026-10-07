@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -180,6 +180,11 @@ def load_settings(
 
 
 # --- окружение ---------------------------------------------------------------
+
+
+def today_in(timezone: str) -> date:
+    """Сегодняшняя дата в часовом поясе проекта (а не сервера)."""
+    return datetime.now(ZoneInfo(timezone)).date()
 
 
 def _load_dotenv() -> None:

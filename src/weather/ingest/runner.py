@@ -10,11 +10,10 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date
 from typing import Any
-from zoneinfo import ZoneInfo
 
-from weather.config import Settings
+from weather.config import Settings, today_in
 from weather.http_client import HttpClient, SourceError
 from weather.ingest.base import Loader
 from weather.ingest.journal import Journal, LoadStats
@@ -50,10 +49,6 @@ class IngestResult:
     run_id: int
     status: str
     outcomes: list[SourceOutcome]
-
-
-def today_in(timezone: str) -> date:
-    return datetime.now(ZoneInfo(timezone)).date()
 
 
 def run_ingest(

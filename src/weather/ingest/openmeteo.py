@@ -10,6 +10,7 @@ from typing import Any
 
 from weather.ingest.base import AdvanceWatermark, Loader, LoadPlan, PayloadError, sha256_text, year_chunks
 from weather.ingest.journal import LoadStats, to_json
+from weather.ingest.schema_registry import openmeteo_fields, register_schema
 
 log = logging.getLogger(__name__)
 
@@ -141,6 +142,7 @@ class OpenMeteoArchiveLoader(Loader):
                 records, error = 0, str(exc)
 
             with self.conn.transaction():
+                change = register_schema(self.conn, self.source_code, openmeteo_fields(payload), load_id)
                 row = self.conn.execute(
                     "INSERT INTO raw.openmeteo_archive (load_id, period_from, period_to, request_url, "
                     "request_params, payload, payload_sha256, is_valid, validation_error) "
@@ -163,6 +165,9 @@ class OpenMeteoArchiveLoader(Loader):
                     if last is not None:
                         advance(last)
 
+            if change:
+                stats.notes.append(f"{chunk_from}..{chunk_to}: {change}")
+                log.warning("%s: %s", self.source_code, change)
             if error is not None:
                 stats.payloads_invalid += 1
                 # Структура ответа сломалась — следующие порции придут такими же, останавливаемся
@@ -220,6 +225,7 @@ class OpenMeteoForecastLoader(Loader):
             records, error = 0, str(exc)
 
         with self.conn.transaction():
+            change = register_schema(self.conn, self.source_code, openmeteo_fields(payload), load_id)
             row = self.conn.execute(
                 "INSERT INTO raw.openmeteo_forecast (load_id, issue_date, request_url, request_params, "
                 "payload, payload_sha256, is_valid, validation_error) "
@@ -239,6 +245,9 @@ class OpenMeteoForecastLoader(Loader):
             if error is None:
                 advance(plan.period_from)
 
+        if change:
+            stats.notes.append(change)
+            log.warning("%s: %s", self.source_code, change)
         if error is not None:
             stats.payloads_invalid += 1
             raise PayloadError(error)

@@ -1,0 +1,358 @@
+# Правила проверки качества данных.
+#
+# Каждое правило — SQL-запрос, который возвращает строки-нарушения.
+# Пустой результат = проверка пройдена.
+#
+# type      — тип проверки (как в методичке): полнота, уникальность, допустимость значений,
+#             соответствие типов, соответствие диапазонам, ссылочная целостность, актуальность;
+#             плюс сверка источников.
+# phase     — когда выполняется:
+#             staging — после разбора данных, до сведения источников в core;
+#             final   — после сборки витрин, до сохранения результата обработки.
+# severity  — что делать, если нарушения найдены:
+#             warning    — записать результат и продолжить;
+#             quarantine — убрать плохие строки в staging.quarantine, дальше они не идут
+#                          (только для phase: staging, нужны table и key);
+#             critical   — отменить всю обработку, витрины остаются как были.
+# enabled   — false, чтобы временно отключить правило.
+#
+# В запросах можно использовать параметры: current_setting('weather.today'),
+# current_setting('weather.history_start'), current_setting('weather.station_id').
+
+rules:
+
+  # ---------------------------------------------------------------- staging
+
+  - code: openmeteo_not_empty
+    type: полнота
+    phase: staging
+    severity: critical
+    table: staging.openmeteo_daily
+    description: Есть данные Open-Meteo для обработки
+    sql: |
+      SELECT 'staging.openmeteo_daily пуста' AS problem
+      WHERE NOT EXISTS (SELECT 1 FROM staging.openmeteo_daily)
+
+  - code: openmeteo_temp_range
+    type: соответствие диапазонам
+    phase: staging
+    severity: quarantine
+    table: staging.openmeteo_daily
+    key: obs_date
+    description: Температура Open-Meteo в пределах от −50 до +45 °C
+    sql: |
+      SELECT obs_date, temp_mean, temp_min, temp_max
+      FROM staging.openmeteo_daily
+      WHERE temp_mean NOT BETWEEN -50 AND 45 OR temp_min < -55 OR temp_max > 50
+
+  - code: openmeteo_temp_order
+    type: допустимость значений
+    phase: staging
+    severity: quarantine
+    table: staging.openmeteo_daily
+    key: obs_date
+    description: У Open-Meteo t мин ≤ t ср ≤ t макс (допуск 0,5 °C)
+    sql: |
+      SELECT obs_date, temp_min, temp_mean, temp_max
+      FROM staging.openmeteo_daily
+      WHERE temp_min > temp_mean + 0.5 OR temp_mean > temp_max + 0.5
+
+  - code: meteostat_temp_range
+    type: соответствие диапазонам
+    phase: staging
+    severity: quarantine
+    table: staging.meteostat_daily
+    key: obs_date
+    description: Температура станции в пределах от −50 до +45 °C
+    sql: |
+      SELECT obs_date, temp_mean, temp_min, temp_max
+      FROM staging.meteostat_daily
+      WHERE temp_mean NOT BETWEEN -50 AND 45 OR temp_min < -55 OR temp_max > 50
+
+  - code: meteostat_temp_order
+    type: допустимость значений
+    phase: staging
+    severity: quarantine
+    table: staging.meteostat_daily
+    key: obs_date
+    description: У станции t мин ≤ t ср ≤ t макс (допуск 0,5 °C)
+    sql: |
+      SELECT obs_date, temp_min, temp_mean, temp_max, temp_source
+      FROM staging.meteostat_daily
+      WHERE temp_min > temp_mean + 0.5 OR temp_mean > temp_max + 0.5
+
+  - code: openmeteo_values_allowed
+    type: допустимость значений
+    phase: staging
+    severity: warning
+    table: staging.openmeteo_daily
+    description: Влажность и облачность 0–100 %, направление ветра 0–360°, осадки и ветер не меньше 0, давление 940–1070 гПа
+    sql: |
+      SELECT obs_date, humidity_pct, cloud_cover_pct, wind_dir_deg, precip_mm, snowfall_cm,
+             wind_speed_ms, pressure_hpa
+      FROM staging.openmeteo_daily
+      WHERE humidity_pct NOT BETWEEN 0 AND 100
+         OR cloud_cover_pct NOT BETWEEN 0 AND 100
+         OR wind_dir_deg NOT BETWEEN 0 AND 360
+         OR precip_mm < 0 OR snowfall_cm < 0 OR wind_speed_ms < 0
+         OR pressure_hpa NOT BETWEEN 940 AND 1070
+
+  - code: meteostat_values_allowed
+    type: допустимость значений
+    phase: staging
+    severity: warning
+    table: staging.meteostat_daily
+    description: Влажность 0–100 %, облачность 0–8 окт, осадки 0–300 мм, снег 0–150 см, давление 940–1070 гПа
+    sql: |
+      SELECT obs_date, humidity_pct, cloud_cover_okta, precip_mm, snow_depth_cm, pressure_hpa
+      FROM staging.meteostat_daily
+      WHERE humidity_pct NOT BETWEEN 0 AND 100
+         OR cloud_cover_okta NOT BETWEEN 0 AND 8
+         OR precip_mm NOT BETWEEN 0 AND 300
+         OR snow_depth_cm NOT BETWEEN 0 AND 150
+         OR pressure_hpa NOT BETWEEN 940 AND 1070
+
+  - code: weather_code_known
+    type: ссылочная целостность
+    phase: staging
+    severity: warning
+    table: staging.openmeteo_daily
+    description: Код погоды есть в справочнике core.dim_weather_code
+    sql: |
+      SELECT o.obs_date, o.weather_code
+      FROM staging.openmeteo_daily o
+      WHERE o.weather_code IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM core.dim_weather_code c WHERE c.code = o.weather_code)
+
+  - code: raw_openmeteo_types
+    type: соответствие типов
+    phase: staging
+    severity: warning
+    table: raw.openmeteo_archive
+    description: В ответах Open-Meteo значения — числа или пусто
+    sql: |
+      SELECT r.response_id, d.key AS variable, e.value
+      FROM raw.openmeteo_archive r
+      CROSS JOIN LATERAL jsonb_each(r.payload -> 'daily') AS d (key, value)
+      CROSS JOIN LATERAL jsonb_array_elements(d.value) AS e (value)
+      WHERE r.is_valid
+        AND d.key <> 'time'
+        AND jsonb_typeof(e.value) NOT IN ('number', 'null')
+
+  - code: raw_meteostat_types
+    type: соответствие типов
+    phase: staging
+    severity: warning
+    table: raw.meteostat_file
+    description: В файлах Meteostat числовые колонки содержат числа
+    sql: |
+      WITH files AS (
+          SELECT DISTINCT ON (year) year, columns, content
+          FROM raw.meteostat_file
+          WHERE is_valid
+          ORDER BY year, fetched_at DESC, file_id DESC
+      )
+      SELECT f.year, u.name AS column_name, u.value
+      FROM files f
+      CROSS JOIN LATERAL string_to_table(f.content, E'\n') WITH ORDINALITY AS l (line, n)
+      CROSS JOIN LATERAL unnest(f.columns, string_to_array(l.line, ',')) AS u (name, value)
+      WHERE l.n > 1
+        AND l.line <> ''
+        AND right(u.name, 7) <> '_source'
+        AND u.value <> ''
+        AND meta.try_numeric(u.value) IS NULL
+
+  # ---------------------------------------------------------------- final
+
+  - code: fact_dates_complete
+    type: полнота
+    phase: final
+    severity: warning
+    table: core.fact_weather_daily
+    description: В ряду по дням нет пропущенных дат (от начала истории до последнего дня)
+    sql: |
+      SELECT d::date AS missing_date
+      FROM generate_series(
+          current_setting('weather.history_start')::date,
+          (SELECT max(obs_date) FROM core.fact_weather_daily WHERE is_current),
+          interval '1 day'
+      ) AS d
+      WHERE NOT EXISTS (
+          SELECT 1 FROM core.fact_weather_daily f
+          WHERE f.is_current AND f.obs_date = d::date AND f.station_id = current_setting('weather.station_id')
+      )
+
+  - code: fact_temp_present
+    type: полнота
+    phase: final
+    severity: critical
+    table: core.fact_weather_daily
+    description: У каждого дня есть среднесуточная температура
+    sql: |
+      SELECT obs_date FROM core.fact_weather_daily WHERE is_current AND temp_mean IS NULL
+
+  - code: fact_one_current_version
+    type: уникальность
+    phase: final
+    severity: critical
+    table: core.fact_weather_daily
+    description: На каждую дату ровно одна текущая версия записи
+    sql: |
+      SELECT station_id, obs_date, count(*) AS versions
+      FROM core.fact_weather_daily
+      WHERE is_current
+      GROUP BY station_id, obs_date
+      HAVING count(*) > 1
+
+  - code: station_one_current_version
+    type: уникальность
+    phase: final
+    severity: critical
+    table: core.dim_station
+    description: У каждой станции ровно одна текущая версия в справочнике
+    sql: |
+      SELECT station_id, count(*) AS versions
+      FROM core.dim_station
+      WHERE is_current
+      GROUP BY station_id
+      HAVING count(*) > 1
+
+  - code: forecast_one_issue
+    type: уникальность
+    phase: final
+    severity: critical
+    table: mart.forecast_latest
+    description: В витрине прогноза у каждой модели один выпуск и одна строка на дату
+    sql: |
+      SELECT model_code, count(DISTINCT issue_date) AS issues, count(*) AS rows, count(DISTINCT target_date) AS dates
+      FROM mart.forecast_latest
+      GROUP BY model_code
+      HAVING count(DISTINCT issue_date) > 1 OR count(*) <> count(DISTINCT target_date)
+
+  - code: fact_station_ref
+    type: ссылочная целостность
+    phase: final
+    severity: critical
+    table: core.fact_weather_daily
+    description: Каждая запись ссылается на существующую версию своей станции
+    sql: |
+      SELECT f.version_id, f.station_id, f.station_key
+      FROM core.fact_weather_daily f
+      LEFT JOIN core.dim_station s ON s.station_key = f.station_key
+      WHERE s.station_key IS NULL OR s.station_id <> f.station_id
+
+  - code: fact_raw_ref
+    type: ссылочная целостность
+    phase: final
+    severity: critical
+    table: core.fact_weather_daily
+    description: Каждая текущая запись ссылается на корректный ответ или файл источника
+    sql: |
+      SELECT f.obs_date, f.openmeteo_response_id, f.meteostat_file_id
+      FROM core.fact_weather_daily f
+      LEFT JOIN raw.openmeteo_archive a ON a.response_id = f.openmeteo_response_id
+      LEFT JOIN raw.meteostat_file m ON m.file_id = f.meteostat_file_id
+      WHERE f.is_current
+        AND ((f.openmeteo_response_id IS NULL AND f.meteostat_file_id IS NULL)
+             OR a.is_valid = false OR m.is_valid = false)
+
+  - code: mart_matches_core
+    type: ссылочная целостность
+    phase: final
+    severity: critical
+    table: mart.weather_daily
+    description: В витрине ровно те же даты, что и в core
+    sql: |
+      SELECT c.obs_date, 'нет в витрине' AS problem
+      FROM core.fact_weather_daily c
+      WHERE c.is_current AND c.station_id = current_setting('weather.station_id')
+        AND NOT EXISTS (SELECT 1 FROM mart.weather_daily m WHERE m.obs_date = c.obs_date)
+      UNION ALL
+      SELECT m.obs_date, 'нет в core'
+      FROM mart.weather_daily m
+      WHERE NOT EXISTS (
+          SELECT 1 FROM core.fact_weather_daily c
+          WHERE c.is_current AND c.obs_date = m.obs_date AND c.station_id = current_setting('weather.station_id')
+      )
+
+  - code: fresh_actual
+    type: актуальность
+    phase: final
+    severity: warning
+    table: core.fact_weather_daily
+    description: Фактические данные не старше двух дней
+    sql: |
+      SELECT max(obs_date) AS last_date
+      FROM core.fact_weather_daily
+      WHERE is_current
+      HAVING max(obs_date) IS NULL OR max(obs_date) < current_setting('weather.today')::date - 2
+
+  - code: fresh_forecast
+    type: актуальность
+    phase: final
+    severity: warning
+    table: core.fact_forecast
+    description: Прогноз Open-Meteo выпущен сегодня
+    sql: |
+      SELECT max(issue_date) AS last_issue
+      FROM core.fact_forecast
+      WHERE model_code = 'openmeteo'
+      HAVING max(issue_date) IS NULL OR max(issue_date) < current_setting('weather.today')::date
+
+  - code: fresh_loads
+    type: актуальность
+    phase: final
+    severity: warning
+    table: meta.load_log
+    description: Каждый источник успешно загружался в последние 2 дня
+    sql: |
+      SELECT source_code, max(finished_at) FILTER (WHERE status IN ('success', 'skipped')) AS last_success
+      FROM meta.load_log
+      GROUP BY source_code
+      HAVING coalesce(max(finished_at) FILTER (WHERE status IN ('success', 'skipped')), '-infinity')
+             < now() - interval '2 days'
+
+  - code: sources_agree
+    type: сверка источников
+    phase: final
+    severity: warning
+    table: core.fact_weather_daily
+    description: Станция и Open-Meteo (с поправкой на смещение) расходятся не больше чем на 5 °C
+    sql: |
+      SELECT f.obs_date, f.temp_mean_station, f.temp_mean_openmeteo, b.temp_mean_bias
+      FROM core.fact_weather_daily f
+      JOIN core.source_bias_monthly b ON b.month = extract(month FROM f.obs_date)
+      WHERE f.is_current
+        AND f.temp_source = 'station'
+        AND abs(f.temp_mean_station - f.temp_mean_openmeteo - b.temp_mean_bias) > 5
+
+  - code: temp_jump
+    type: соответствие диапазонам
+    phase: final
+    severity: warning
+    table: core.fact_weather_daily
+    description: Среднесуточная температура не меняется больше чем на 15 °C за сутки
+    sql: |
+      SELECT obs_date, prev_temp, temp_mean
+      FROM (
+          SELECT obs_date, temp_mean, lag(temp_mean) OVER (ORDER BY obs_date) AS prev_temp
+          FROM core.fact_weather_daily
+          WHERE is_current AND station_id = current_setting('weather.station_id')
+      ) x
+      WHERE abs(temp_mean - prev_temp) > 15
+
+  - code: source_schema_changed
+    type: соответствие типов
+    phase: final
+    severity: warning
+    table: meta.source_schema
+    description: Источники не меняли формат данных за последнюю неделю (реестр схем)
+    sql: |
+      SELECT s.source_code, s.first_seen_at, s.fields
+      FROM meta.source_schema s
+      WHERE s.first_seen_at > now() - interval '7 days'
+        AND s.first_seen_at > (
+            SELECT min(o.first_seen_at) + interval '1 day'
+            FROM meta.source_schema o
+            WHERE o.source_code = s.source_code
+        )

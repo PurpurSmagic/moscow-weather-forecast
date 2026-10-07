@@ -12,6 +12,7 @@ from datetime import date, timedelta
 
 from weather.ingest.base import AdvanceWatermark, Loader, LoadPlan, PayloadError, sha256_text
 from weather.ingest.journal import LoadStats
+from weather.ingest.schema_registry import register_schema
 
 log = logging.getLogger(__name__)
 
@@ -135,8 +136,13 @@ class MeteostatLoader(Loader):
                 last = last_observed_date(rows, before=self.today)
             except PayloadError as exc:
                 error, last = str(exc), None
+                # заголовок нужен реестру схем, даже если файл не прошёл проверку
+                columns = text.split("\n", 1)[0].strip().split(",") if text.strip() else []
 
             with self.conn.transaction():
+                schema_change = (
+                    register_schema(self.conn, self.source_code, columns, load_id) if columns else None
+                )
                 row = self.conn.execute(
                     "INSERT INTO raw.meteostat_file (load_id, station_id, year, url, etag, last_modified, "
                     "content, content_sha256, columns, row_count, is_valid, validation_error) "
@@ -160,6 +166,9 @@ class MeteostatLoader(Loader):
                 if last is not None:
                     advance(last)
 
+            if schema_change:
+                stats.notes.append(f"{year}: {schema_change}")
+                log.warning("%s: %s — %s", self.source_code, year, schema_change)
             if error is not None:
                 # Испорченный файл за один год не мешает загрузить остальные
                 stats.payloads_invalid += 1

@@ -6,9 +6,11 @@ python -m weather ingest    — загрузить новые данные из 
 python -m weather transform — обработать данные: raw -> staging -> core -> mart
 python -m weather show      — погода за последние дни, прогноз и признаки для решений
 python -m weather loads     — журнал последних загрузок и отметки загрузки
+python -m weather dq        — проверки качества данных (без изменения данных)
 python -m weather check     — проверить настройки, подключение, слои, миграции и источники
 
-Коды возврата: 0 — успешно, 1 — ошибка или загрузка с ошибками, 2 — ошибка настроек.
+Коды возврата: 0 — успешно, 1 — ошибка, загрузка с ошибками или не прошла критичная
+проверка качества, 2 — ошибка настроек.
 """
 
 from __future__ import annotations
@@ -58,6 +60,10 @@ def main(argv: list[str] | None = None) -> int:
     loads = commands.add_parser("loads", help="журнал последних загрузок и отметки загрузки")
     loads.add_argument("--limit", type=int, default=15, help="сколько последних загрузок показать")
 
+    dq = commands.add_parser("dq", help="проверки качества данных (без изменения данных)")
+    dq.add_argument("--phase", choices=("staging", "final"), help="только правила этого этапа")
+    dq.add_argument("--all", action="store_true", help="показать и пройденные проверки")
+
     commands.add_parser("check", help="проверить настройки, подключение, слои, миграции и источники")
     args = parser.parse_args(argv)
 
@@ -67,7 +73,7 @@ def main(argv: list[str] | None = None) -> int:
         setup_logging("INFO")
         log.error("Ошибка настроек: %s", exc)
         return 2
-    setup_logging(settings.log_level)
+    setup_logging(settings.log_level, settings.timezone)
 
     handlers = {
         "run": cmd_run,
@@ -76,6 +82,7 @@ def main(argv: list[str] | None = None) -> int:
         "transform": cmd_transform,
         "show": cmd_show,
         "loads": cmd_loads,
+        "dq": cmd_dq,
         "check": cmd_check,
     }
     try:
@@ -103,11 +110,17 @@ def cmd_run(settings: Settings, args: argparse.Namespace) -> int:
 
 def cmd_transform(settings: Settings, args: argparse.Namespace) -> int:
     from weather import db
-    from weather.transform import run_transform
+    from weather.transform import TransformError, run_transform
 
     db.wait_for_db(settings.db)
     with db.connect(settings.db, autocommit=True) as conn:
-        result = run_transform(settings, conn)
+        try:
+            result = run_transform(settings, conn)
+        except TransformError as exc:
+            if exc.checks:
+                print("\nПроверки качества (изменения отменены, витрины не менялись):")
+                _print_checks(exc.checks, show_passed=False)
+            raise
     print(f"\nПреобразование №{result.transform_run_id}: {result.status}")
     print(
         _table(
@@ -115,7 +128,76 @@ def cmd_transform(settings: Settings, args: argparse.Namespace) -> int:
             [[s.step, s.target, s.rows_after, s.duration_ms] for s in result.steps],
         )
     )
+    print("\nПроверки качества:")
+    _print_checks(result.checks, show_passed=False)
     return 0
+
+
+def cmd_dq(settings: Settings, args: argparse.Namespace) -> int:
+    """Проверки по текущим данным: ничего не меняет, результаты пишет в meta.dq_result."""
+    from weather import db, dq
+    from weather.config import today_in
+    from weather.transform import session_params, set_params
+
+    rules = dq.load_rules()
+    with db.connect(settings.db, autocommit=True) as conn:
+        if not conn.execute("SELECT to_regclass('meta.dq_result') IS NOT NULL").fetchone()[0]:
+            print("Таблиц для проверок ещё нет — сначала выполните: python -m weather migrate")
+            return 1
+        with conn.transaction():
+            set_params(conn, session_params(settings, None, today_in(settings.timezone)))
+            checks = dq.run_checks(conn, rules, args.phase)
+        dq.save_results(conn, checks, None)
+        quarantine = conn.execute(
+            "SELECT rule_code, source_table, count(*), min(row_key), max(row_key) "
+            "FROM staging.quarantine GROUP BY rule_code, source_table ORDER BY rule_code"
+        ).fetchall()
+
+    print(f"Проверки качества данных ({len(checks)} правил):")
+    _print_checks(checks, show_passed=args.all)
+    if quarantine:
+        print("\nВ карантине после последней обработки:")
+        print(
+            _table(
+                ["правило", "таблица", "строк", "ключи"],
+                [[r, t, n, k1 if k1 == k2 else f"{k1} … {k2}"] for r, t, n, k1, k2 in quarantine],
+            )
+        )
+    return 1 if dq.blocking(checks) else 0
+
+
+def _print_checks(checks: list[Any], show_passed: bool) -> None:
+    from weather import dq
+
+    print("  " + dq.summary(checks))
+    shown = [c for c in checks if show_passed or c.status != "passed"]
+    if not shown:
+        return
+    status_names = {"passed": "ок", "failed": "нарушения", "error": "ошибка"}
+    print(
+        _table(
+            ["правило", "тип", "уровень", "статус", "строк", "пример / сообщение"],
+            [
+                [
+                    c.rule.code,
+                    c.rule.check_type,
+                    c.rule.severity,
+                    status_names[c.status],
+                    c.failed_rows,
+                    _shorten(_example(c), 70),
+                ]
+                for c in shown
+            ],
+        )
+    )
+
+
+def _example(check: Any) -> str:
+    if check.status == "error" or not check.sample:
+        return check.message or ""
+    first = check.sample[0]
+    text = ", ".join(f"{k}={v}" for k, v in first.items()) if isinstance(first, dict) else str(first)
+    return f"{check.message}; {text}" if check.message else text
 
 
 def cmd_show(settings: Settings, args: argparse.Namespace) -> int:

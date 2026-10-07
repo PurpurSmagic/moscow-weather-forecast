@@ -10,8 +10,9 @@ from datetime import date, timedelta
 from weather.http_client import HttpResult, SourceUnavailable
 
 
-def default_value(day: date) -> float:
-    return round(5 + (day.toordinal() % 7) * 0.5, 1)
+def default_value(day: date, name: str = "") -> float:
+    base = 1005 if name == "pressure_msl_mean" else 5  # давление — в правдоподобных гПа
+    return round(base + (day.toordinal() % 7) * 0.5, 1)
 
 
 def fake_daily_payload(variables, start: date, end: date, drop=(), overrides=None):
@@ -23,7 +24,7 @@ def fake_daily_payload(variables, start: date, end: date, drop=(), overrides=Non
         if name in drop:
             continue
         values = overrides.get(name, {})
-        daily[name] = [values.get(d, default_value(d)) for d in days]
+        daily[name] = [values.get(d, default_value(d, name)) for d in days]
     if "weather_code" in daily:
         daily["weather_code"] = [overrides.get("weather_code", {}).get(d, 3) for d in days]
     return {
@@ -48,8 +49,9 @@ def fake_meteostat_csv(year, today, temps=None, default=5.0, gaps=(), model_days
     while day <= last:
         source = "dwd_mosmix" if day >= today or day in model_days else "dwd_poi"
         temp = "" if day in gaps else temps.get(day, default)
-        writer.writerow([day.year, day.month, day.day, temp, source if temp != "" else "", 1.0, source,
-                         9.0, source, 0.0, source])  # fmt: skip
+        tmin, tmax = (1.0, 9.0) if temp == "" else (temp - 4, temp + 4)
+        writer.writerow([day.year, day.month, day.day, temp, source if temp != "" else "", tmin, source,
+                         tmax, source, 0.0, source])  # fmt: skip
         day += timedelta(days=1)
     return gzip.compress(out.getvalue().encode("utf-8"))
 

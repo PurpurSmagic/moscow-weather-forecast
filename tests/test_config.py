@@ -83,3 +83,14 @@ def test_invalid_log_level_rejected():
 def test_missing_config_file(tmp_path):
     with pytest.raises(ConfigError, match="Не найден"):
         load_settings(tmp_path / "nope.yaml", environ=BASE_ENV)
+
+
+def test_log_time_is_in_project_timezone():
+    import logging
+
+    from weather.logging_setup import setup_logging
+
+    setup_logging("INFO", "Europe/Moscow")
+    formatter = logging.getLogger().handlers[0].formatter
+    record = logging.makeLogRecord({"created": 0})  # 1970-01-01 00:00 UTC
+    assert formatter.formatTime(record, formatter.datefmt) == "1970-01-01 03:00:00"

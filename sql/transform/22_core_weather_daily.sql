@@ -88,14 +88,16 @@ WHERE f.is_current
 
 -- 2. Добавляем версии для новых дат и для дат, где версия только что закрыта
 INSERT INTO core.fact_weather_daily (
-    station_id, obs_date, temp_mean, temp_min, temp_max, temp_source, temp_mean_station,
+    station_id, station_key, obs_date,
+    temp_mean, temp_min, temp_max, temp_source, temp_mean_station,
     temp_mean_openmeteo, precip_mm, precip_source, rain_mm, snowfall_cm, snow_depth_cm,
     wind_speed_ms, wind_gust_ms, wind_dir_deg, pressure_hpa, humidity_pct, cloud_cover_pct,
     dew_point_c, radiation_mj_m2, weather_code, openmeteo_response_id, meteostat_file_id,
     row_hash, valid_from, valid_to, is_current, transform_run_id
 )
 SELECT
-    t.station_id, t.obs_date, t.temp_mean, t.temp_min, t.temp_max, t.temp_source, t.temp_mean_station,
+    t.station_id, current_setting('weather.station_key')::int, t.obs_date,
+    t.temp_mean, t.temp_min, t.temp_max, t.temp_source, t.temp_mean_station,
     t.temp_mean_openmeteo, t.precip_mm, t.precip_source, t.rain_mm, t.snowfall_cm, t.snow_depth_cm,
     t.wind_speed_ms, t.wind_gust_ms, t.wind_dir_deg, t.pressure_hpa, t.humidity_pct, t.cloud_cover_pct,
     t.dew_point_c, t.radiation_mj_m2, t.weather_code, t.openmeteo_response_id, t.meteostat_file_id,

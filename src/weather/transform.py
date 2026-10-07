@@ -7,6 +7,10 @@
 
 Параметры из настроек (станция, пороги, периоды) передаются в SQL через
 set_config, в SQL они читаются как current_setting('weather.<имя>').
+
+Внутри той же транзакции выполняются проверки качества данных (dq.py):
+после шагов staging — с переносом плохих строк в карантин, в конце — итоговые.
+Если не прошла критичная проверка, всё откатывается.
 """
 
 from __future__ import annotations
@@ -14,11 +18,13 @@ from __future__ import annotations
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from typing import Any
 
-from weather.config import PROJECT_ROOT, Settings
+from weather import dq
+from weather.config import PROJECT_ROOT, Settings, today_in
 
 log = logging.getLogger(__name__)
 
@@ -28,7 +34,15 @@ TRANSFORM_LOCK_KEY = 27612_0003
 
 
 class TransformError(RuntimeError):
-    """Шаг преобразования завершился ошибкой; изменения откатены."""
+    """Шаг преобразования или критичная проверка завершились ошибкой; изменения откатены."""
+
+    def __init__(self, message: str, checks: list[dq.CheckResult] | None = None) -> None:
+        super().__init__(message)
+        self.checks = checks or []
+
+
+class QualityError(RuntimeError):
+    """Не прошли критичные проверки качества."""
 
 
 @dataclass(frozen=True)
@@ -52,6 +66,7 @@ class TransformResult:
     transform_run_id: int
     status: str
     steps: list[StepResult]
+    checks: list[dq.CheckResult] = field(default_factory=list)
 
 
 def discover_steps(directory: Path = TRANSFORM_DIR) -> list[Step]:
@@ -67,10 +82,11 @@ def discover_steps(directory: Path = TRANSFORM_DIR) -> list[Step]:
     return steps
 
 
-def session_params(settings: Settings, transform_run_id: int) -> dict[str, str]:
+def session_params(settings: Settings, transform_run_id: int | None, today: date) -> dict[str, str]:
     p = settings.processing
     return {
-        "weather.transform_run_id": str(transform_run_id),
+        "weather.transform_run_id": str(transform_run_id or 0),
+        "weather.today": today.isoformat(),
         "weather.station_id": settings.station.wmo_id,
         "weather.timezone": settings.timezone,
         "weather.history_start": settings.history_start.isoformat(),
@@ -84,53 +100,120 @@ def session_params(settings: Settings, transform_run_id: int) -> dict[str, str]:
     }
 
 
-def run_transform(settings: Settings, conn: Any, directory: Path = TRANSFORM_DIR) -> TransformResult:
-    """Выполняет все шаги. Подключение должно быть в режиме autocommit."""
+def run_transform(
+    settings: Settings,
+    conn: Any,
+    directory: Path = TRANSFORM_DIR,
+    *,
+    rules: list[dq.Rule] | None = None,
+    today: date | None = None,
+) -> TransformResult:
+    """Выполняет все шаги и проверки качества. Подключение должно быть в режиме autocommit."""
     steps = discover_steps(directory)
+    rules = dq.load_rules() if rules is None else rules
+    today = today or today_in(settings.timezone)
     run_id = conn.execute(
         "INSERT INTO meta.transform_run DEFAULT VALUES RETURNING transform_run_id"
     ).fetchone()[0]
-    log.info("Преобразование №%d: %d шагов", run_id, len(steps))
+    log.info("Преобразование №%d: %d шагов, %d правил проверки", run_id, len(steps), len(rules))
 
     results: list[StepResult] = []
-    current: Step | None = None
-    started = time.perf_counter()
+    checks: list[dq.CheckResult] = []
+    where, current, started = "подготовка", None, time.perf_counter()
     try:
         with conn.transaction():
             conn.execute("SELECT pg_advisory_xact_lock(%s)", (TRANSFORM_LOCK_KEY,))
-            for name, value in session_params(settings, run_id).items():
-                conn.execute("SELECT set_config(%s, %s, true)", (name, value))
-            _upsert_station(conn, settings)
+            set_params(conn, session_params(settings, run_id, today))
+            station_key = upsert_station(conn, settings)
+            conn.execute("SELECT set_config('weather.station_key', %s, true)", (str(station_key),))
+            conn.execute("TRUNCATE staging.quarantine")
+
+            staging_checked = False
             for step in steps:
-                current, started = step, time.perf_counter()
+                if not staging_checked and not step.target.startswith("staging."):
+                    where, current = "проверки staging", None
+                    _check(conn, rules, "staging", run_id, checks)
+                    staging_checked = True
+                where, current, started = step.name, step, time.perf_counter()
                 conn.execute(step.sql)
                 rows = conn.execute(f"SELECT count(*) FROM {step.target}").fetchone()[0]
                 results.append(StepResult(step.name, step.target, "success", rows, _ms(started)))
                 log.info("%s → %s: %d строк", step.name, step.target, rows)
+            current = None
+            if not staging_checked:
+                where = "проверки staging"
+                _check(conn, rules, "staging", run_id, checks)
+            where = "итоговые проверки"
+            _check(conn, rules, "final", run_id, checks)
     except Exception as exc:
         if current is not None:
             results.append(StepResult(current.name, current.target, "failed", None, _ms(started)))
-        _finish(conn, run_id, "failed", results, f"{current.name if current else 'подготовка'}: {exc}")
-        raise TransformError(f"шаг {current.name if current else 'подготовка'}: {exc}") from exc
+        _finish(conn, run_id, "failed", results, checks, f"{where}: {exc}")
+        raise TransformError(f"{where}: {exc}", checks) from exc
 
-    _finish(conn, run_id, "success", results, None)
-    log.info("Преобразование №%d завершено", run_id)
-    return TransformResult(run_id, "success", results)
+    _finish(conn, run_id, "success", results, checks, None)
+    log.info("Преобразование №%d завершено; %s", run_id, dq.summary(checks))
+    return TransformResult(run_id, "success", results, checks)
 
 
-def _upsert_station(conn: Any, settings: Settings) -> None:
+def set_params(conn: Any, params: dict[str, str]) -> None:
+    """Параметры для SQL на время текущей транзакции."""
+    for name, value in params.items():
+        conn.execute("SELECT set_config(%s, %s, true)", (name, value))
+
+
+def _check(conn: Any, rules: list[dq.Rule], phase: str, run_id: int, checks: list[dq.CheckResult]) -> None:
+    """Проверки одного этапа. Результаты добавляются в checks (их сохраним, даже если всё откатится)."""
+    phase_checks = dq.run_checks(conn, rules, phase, quarantine_run_id=run_id)
+    checks.extend(phase_checks)
+    for c in phase_checks:
+        if c.status == "failed" and c.rule.severity != "critical":
+            note = f" ({c.message})" if c.message else ""
+            log.warning("Проверка %s: нарушений %d%s", c.rule.code, c.failed_rows, note)
+    bad = dq.blocking(phase_checks)
+    if bad:
+        raise QualityError("не прошли критичные проверки: " + ", ".join(c.rule.code for c in bad))
+
+
+def upsert_station(conn: Any, settings: Settings) -> int:
+    """Справочник станций с историей (SCD2). Возвращает номер текущей версии станции.
+
+    Если описание станции в настройках не менялось — ничего не делаем. Если поменялось —
+    закрываем текущую версию и добавляем новую.
+    """
     s = settings.station
-    conn.execute(
+    new = (s.wmo_id, s.name, round(s.latitude, 4), round(s.longitude, 4), round(s.elevation_m, 1))
+    row = conn.execute(
+        "SELECT station_key, wmo_id, name, latitude, longitude, elevation_m "
+        "FROM core.dim_station WHERE station_id = %s AND is_current",
+        (s.wmo_id,),
+    ).fetchone()
+    if row is not None:
+        key, wmo_id, name, lat, lon, elev = row
+        old = (str(wmo_id), name, round(float(lat), 4), round(float(lon), 4), round(float(elev or 0), 1))
+        if old == new:
+            return int(key)
+        conn.execute(
+            "UPDATE core.dim_station SET valid_to = now(), is_current = false WHERE station_key = %s", (key,)
+        )
+        log.info("Станция %s: описание изменилось, добавлена новая версия", s.wmo_id)
+    row = conn.execute(
         "INSERT INTO core.dim_station (station_id, wmo_id, name, latitude, longitude, elevation_m) "
-        "VALUES (%s, %s, %s, %s, %s, %s) "
-        "ON CONFLICT (station_id) DO UPDATE SET wmo_id = EXCLUDED.wmo_id, name = EXCLUDED.name, "
-        "latitude = EXCLUDED.latitude, longitude = EXCLUDED.longitude, "
-        "elevation_m = EXCLUDED.elevation_m, updated_at = now()",
-        (s.wmo_id, s.wmo_id, s.name, s.latitude, s.longitude, s.elevation_m),
-    )
+        "VALUES (%s, %s, %s, %s, %s, %s) RETURNING station_key",
+        (s.wmo_id, *new),
+    ).fetchone()
+    return int(row[0])
 
 
-def _finish(conn: Any, run_id: int, status: str, results: list[StepResult], error: str | None) -> None:
+def _finish(
+    conn: Any,
+    run_id: int,
+    status: str,
+    results: list[StepResult],
+    checks: list[dq.CheckResult],
+    error: str | None,
+) -> None:
+    dq.save_results(conn, checks, run_id)
     for r in results:
         conn.execute(
             "INSERT INTO meta.transform_step "
