@@ -1,8 +1,10 @@
 """Командная строка проекта.
 
-python -m weather run       — полный цикл: миграции + загрузка всех источников
+python -m weather run       — полный цикл: миграции, загрузка, обработка
 python -m weather migrate   — применить новые миграции схемы БД
 python -m weather ingest    — загрузить новые данные из источников
+python -m weather transform — обработать данные: raw -> staging -> core -> mart
+python -m weather show      — погода за последние дни, прогноз и признаки для решений
 python -m weather loads     — журнал последних загрузок и отметки загрузки
 python -m weather check     — проверить настройки, подключение, слои, миграции и источники
 
@@ -34,7 +36,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", help="путь к YAML-файлу настроек (по умолчанию из WEATHER_CONFIG)")
     commands = parser.add_subparsers(dest="command", required=True, metavar="КОМАНДА")
 
-    run = commands.add_parser("run", help="полный цикл: миграции и загрузка всех источников")
+    run = commands.add_parser("run", help="полный цикл: миграции, загрузка и обработка данных")
     run.add_argument("--trigger", choices=("manual", "schedule"), default="manual", help="кто запустил")
 
     commands.add_parser("migrate", help="применить новые миграции схемы БД")
@@ -47,6 +49,11 @@ def main(argv: list[str] | None = None) -> int:
         help="загрузить только этот источник (можно указать несколько раз)",
     )
     ingest.add_argument("--trigger", choices=("manual", "schedule"), default="manual", help="кто запустил")
+
+    commands.add_parser("transform", help="обработать данные: raw -> staging -> core -> mart")
+
+    show = commands.add_parser("show", help="погода за последние дни, прогноз и признаки для решений")
+    show.add_argument("--days", type=int, default=7, help="сколько последних дней факта показать")
 
     loads = commands.add_parser("loads", help="журнал последних загрузок и отметки загрузки")
     loads.add_argument("--limit", type=int, default=15, help="сколько последних загрузок показать")
@@ -66,6 +73,8 @@ def main(argv: list[str] | None = None) -> int:
         "run": cmd_run,
         "migrate": cmd_migrate,
         "ingest": cmd_ingest,
+        "transform": cmd_transform,
+        "show": cmd_show,
         "loads": cmd_loads,
         "check": cmd_check,
     }
@@ -85,7 +94,101 @@ def cmd_run(settings: Settings, args: argparse.Namespace) -> int:
     if code:
         return code
     args.source = None
-    return cmd_ingest(settings, args)
+    ingest_code = cmd_ingest(settings, args)
+    # Обработка идёт, даже если какой-то источник не загрузился: используются данные,
+    # загруженные раньше
+    transform_code = cmd_transform(settings, args)
+    return ingest_code or transform_code
+
+
+def cmd_transform(settings: Settings, args: argparse.Namespace) -> int:
+    from weather import db
+    from weather.transform import run_transform
+
+    db.wait_for_db(settings.db)
+    with db.connect(settings.db, autocommit=True) as conn:
+        result = run_transform(settings, conn)
+    print(f"\nПреобразование №{result.transform_run_id}: {result.status}")
+    print(
+        _table(
+            ["шаг", "таблица", "строк", "время, мс"],
+            [[s.step, s.target, s.rows_after, s.duration_ms] for s in result.steps],
+        )
+    )
+    return 0
+
+
+def cmd_show(settings: Settings, args: argparse.Namespace) -> int:
+    from weather import db
+
+    with db.connect(settings.db, autocommit=True) as conn:
+        if not conn.execute("SELECT to_regclass('mart.weather_daily') IS NOT NULL").fetchone()[0]:
+            print("Витрин ещё нет — сначала выполните: python -m weather run")
+            return 1
+        actual = conn.execute(
+            "SELECT obs_date, temp_mean, temp_norm, temp_anomaly, temp_source, cold_streak_days, "
+            "heating_condition_met, precip_mm, weather_description "
+            "FROM mart.weather_daily ORDER BY obs_date DESC LIMIT %s",
+            (args.days,),
+        ).fetchall()
+        forecast = conn.execute(
+            "SELECT target_date, temp_mean, temp_min, temp_max, temp_anomaly, cold_streak_days, "
+            "heating_condition_met, ice_risk, weather_description, issue_date "
+            "FROM mart.forecast_latest WHERE model_code = 'openmeteo' ORDER BY target_date"
+        ).fetchall()
+    if not actual:
+        print("Витрины пустые — сначала выполните: python -m weather run")
+        return 1
+
+    h = settings.heating
+    cold = f"дней < {h.threshold_c:+g}°"
+    print(f"{settings.station.name}: последние {len(actual)} дн. (данные по {actual[0][0]})")
+    print(
+        _table(
+            ["дата", "t ср", "норма", "откл.", "источник", cold, "осадки, мм", "погода"],
+            [
+                [d, t, n, _signed(a), "станция" if src == "station" else "Open-Meteo*", k, p, w]
+                for d, t, n, a, src, k, _, p, w in reversed(actual)
+            ],
+        )
+    )
+    if any(row[4] != "station" for row in actual):
+        print("  * у станции нет наблюдения за день — взято из Open-Meteo с поправкой на смещение")
+
+    if forecast:
+        print(f"\nПрогноз Open-Meteo от {forecast[0][9]} (приведён к станции):")
+        print(
+            _table(
+                ["дата", "t ср", "t мин", "t макс", "откл.", cold, "отопление", "гололёд", "погода"],
+                [
+                    [d, t, tmin, tmax, _signed(a), k, "да" if heat else "—", "риск" if ice else "—", w]
+                    for d, t, tmin, tmax, a, k, heat, ice, w, _ in forecast
+                ],
+            )
+        )
+
+    print()
+    streak, met = actual[0][5], actual[0][6]
+    if met:
+        print(f"Отопление: условие выполнено — {streak} дн. подряд ниже {h.threshold_c:+g} °C.")
+    else:
+        print(
+            f"Отопление: сейчас {streak} дн. подряд ниже {h.threshold_c:+g} °C, нужно {h.consecutive_days}."
+        )
+        heat_day = next((row[0] for row in forecast if row[6]), None)
+        if heat_day:
+            print(f"  По прогнозу условие выполнится {heat_day}.")
+        elif forecast:
+            print("  По прогнозу на неделю условие не выполнится.")
+    ice_days = [str(row[0]) for row in forecast if row[7]]
+    print(
+        "Гололёд: " + (f"риск по прогнозу — {', '.join(ice_days)}." if ice_days else "по прогнозу риска нет.")
+    )
+    return 0
+
+
+def _signed(value: Any) -> str:
+    return "" if value is None else f"{value:+.1f}"
 
 
 def cmd_migrate(settings: Settings, args: argparse.Namespace) -> int:
@@ -162,6 +265,11 @@ def cmd_loads(settings: Settings, args: argparse.Namespace) -> int:
             "FROM meta.load_log ORDER BY load_id DESC LIMIT %s",
             (settings.timezone, args.limit),
         ).fetchall()
+        transforms = conn.execute(
+            "SELECT transform_run_id, to_char(started_at AT TIME ZONE %s, 'YYYY-MM-DD HH24:MI'), status, "
+            "coalesce(error_message, '') FROM meta.transform_run ORDER BY transform_run_id DESC LIMIT 5",
+            (settings.timezone,),
+        ).fetchall()
         marks = conn.execute(
             "SELECT s.source_code, coalesce(w.loaded_until::text, '—'), "
             "coalesce(to_char(w.updated_at AT TIME ZONE %s, 'YYYY-MM-DD HH24:MI'), '—') "
@@ -193,6 +301,13 @@ def cmd_loads(settings: Settings, args: argparse.Namespace) -> int:
     )
     print("\nОтметки загрузки:")
     print(_table(["источник", "загружено по", "обновлено"], [list(row) for row in marks]))
+    print("\nПоследние преобразования:")
+    print(
+        _table(
+            ["№", "начало", "статус", "ошибка"],
+            [list(row[:-1]) + [_shorten(row[-1], 80)] for row in transforms],
+        )
+    )
     return 0
 
 

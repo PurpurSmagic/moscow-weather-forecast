@@ -110,6 +110,14 @@ class SourcesSettings:
 
 
 @dataclass(frozen=True)
+class ProcessingSettings:
+    climate_norm_from_year: int
+    climate_norm_to_year: int
+    bias_period_from: date
+    bias_period_to: date
+
+
+@dataclass(frozen=True)
 class Settings:
     db: DatabaseSettings
     station: StationSettings
@@ -121,6 +129,7 @@ class Settings:
     ice_threshold_c: float
     http: HttpSettings
     sources: SourcesSettings
+    processing: ProcessingSettings
     log_level: str
     config_path: Path
     # Полное содержимое YAML — для разделов, которые появятся на следующих этапах
@@ -163,6 +172,7 @@ def load_settings(
         ),
         http=_http_settings(_section(data, "http")),
         sources=_sources_settings(_section(data, "sources")),
+        processing=_processing_settings(_section(data, "processing")),
         log_level=_log_level(environ),
         config_path=path,
         raw=data,
@@ -366,3 +376,16 @@ def _variables(section: Mapping[str, Any], where: str) -> tuple[str, ...]:
             f"{where}.daily_variables должен включать temperature_2m_mean — это целевой показатель"
         )
     return variables
+
+
+def _processing_settings(section: Mapping[str, Any]) -> ProcessingSettings:
+    where = "processing"
+    norm_from = _int_in_range(section, "climate_norm_from_year", where, 1940, 2100)
+    norm_to = _int_in_range(section, "climate_norm_to_year", where, 1940, 2100)
+    if norm_from > norm_to:
+        raise ConfigError(f"{where}: climate_norm_from_year больше climate_norm_to_year")
+    bias_from = _parse_date(section, "bias_period_from", where)
+    bias_to = _parse_date(section, "bias_period_to", where)
+    if bias_from > bias_to:
+        raise ConfigError(f"{where}: bias_period_from позже bias_period_to")
+    return ProcessingSettings(norm_from, norm_to, bias_from, bias_to)

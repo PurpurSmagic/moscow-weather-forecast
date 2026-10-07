@@ -4,106 +4,13 @@
 устойчивость к сбоям и журнал загрузок.
 """
 
-import csv
-import gzip
-import io
-import json
 from dataclasses import replace
 from datetime import date, timedelta
 
-from weather.http_client import HttpResult, SourceUnavailable
+from fakes import FakeHttp
+
 from weather.ingest.journal import Journal
 from weather.ingest.runner import run_ingest, today_in
-
-# --- подменённые источники --------------------------------------------------------
-
-
-def fake_daily_payload(variables, start: date, end: date, drop=()):
-    days = [(start + timedelta(days=i)) for i in range((end - start).days + 1)]
-    daily = {"time": [d.isoformat() for d in days]}
-    for name in variables:
-        if name not in drop:
-            daily[name] = [round(5 + (d.toordinal() % 7) * 0.5, 1) for d in days]
-    units = {name: "°C" for name in variables}
-    return {
-        "latitude": 55.85,
-        "longitude": 37.65,
-        "generationtime_ms": 0.5,
-        "daily_units": units,
-        "daily": daily,
-    }
-
-
-def fake_meteostat_csv(year: int, today: date) -> bytes:
-    """Годовой файл: прошедшие дни — наблюдения, 7 дней вперёд — прогноз модели (как у Meteostat)."""
-    out = io.StringIO()
-    writer = csv.writer(out, lineterminator="\n")
-    writer.writerow(
-        [
-            "year",
-            "month",
-            "day",
-            "temp",
-            "temp_source",
-            "tmin",
-            "tmin_source",
-            "tmax",
-            "tmax_source",
-            "prcp",
-            "prcp_source",
-        ]
-    )
-    day = date(year, 1, 1)
-    last = min(date(year, 12, 31), today + timedelta(days=7))
-    while day <= last:
-        source = "dwd_poi" if day < today else "dwd_mosmix"
-        writer.writerow([day.year, day.month, day.day, 5.0, source, 1.0, source, 9.0, source, 0.0, source])
-        day += timedelta(days=1)
-    return gzip.compress(out.getvalue().encode("utf-8"))
-
-
-class FakeHttp:
-    """Вместо сети: отвечает по URL. Можно «сломать» источник или конкретную порцию."""
-
-    def __init__(self, settings, today, broken=(), fail_on_chunk=None, drop_variable=None):
-        self.settings, self.today = settings, today
-        self.broken = set(broken)
-        self.fail_on_chunk = fail_on_chunk
-        self.drop_variable = drop_variable
-        self.archive_calls = 0
-        self.requests = self.retries = 0
-
-    def reset_stats(self):
-        self.requests = self.retries = 0
-
-    def get(
-        self, url, params=None, headers=None, *, min_interval_s=None, accept_statuses=frozenset({200, 304})
-    ):
-        self.requests += 1
-        sources = self.settings.sources
-        if url == sources.openmeteo_archive.url:
-            if "archive" in self.broken:
-                raise SourceUnavailable("архив недоступен")
-            self.archive_calls += 1
-            if self.fail_on_chunk == self.archive_calls:
-                raise SourceUnavailable("обрыв на середине истории")
-            start, end = date.fromisoformat(params["start_date"]), date.fromisoformat(params["end_date"])
-            drop = (self.drop_variable,) if self.drop_variable else ()
-            payload = fake_daily_payload(sources.openmeteo_archive.daily_variables, start, end, drop)
-            return HttpResult(200, url, {}, json.dumps(payload).encode())
-        if url == sources.openmeteo_forecast.url:
-            end = self.today + timedelta(days=params["forecast_days"] - 1)
-            payload = fake_daily_payload(sources.openmeteo_forecast.daily_variables, self.today, end)
-            return HttpResult(200, url, {}, json.dumps(payload).encode())
-        if "meteostat" in url:
-            if "meteostat" in self.broken:
-                raise SourceUnavailable("Meteostat недоступен")
-            year = int(url.split("/")[-2])
-            etag = f'"{year}-v1"'
-            if headers and headers.get("If-None-Match") == etag:
-                return HttpResult(304, url, {}, b"")
-            return HttpResult(200, url, {"ETag": etag}, fake_meteostat_csv(year, self.today))
-        raise AssertionError(f"неожиданный URL {url}")
 
 
 def setup(fresh_db, days_of_history=20):
