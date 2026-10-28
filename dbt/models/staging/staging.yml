@@ -1,0 +1,65 @@
+version: 2
+
+models:
+  - name: parsed_openmeteo_daily
+    description: Разбор JSON-ответов Open-Meteo (история) — промежуточный шаг, в базе не хранится
+
+  - name: parsed_meteostat_daily
+    description: Разбор CSV-файлов Meteostat — промежуточный шаг, в базе не хранится
+
+  - name: quarantine
+    description: Строки, убранные проверками качества уровня quarantine, — какое правило сработало и сама строка
+    columns:
+      - name: rule_code
+        description: Правило (тест) с тем же названием в tests/
+      - name: source_table
+        description: Таблица staging, в которую строка не попала
+      - name: row_key
+        description: Дата строки
+      - name: row_data
+        description: Строка целиком (JSON)
+
+  - name: openmeteo_daily
+    description: Open-Meteo, история по дням. Ветер переведён из км/ч в м/с, высота снега из м в см
+    columns:
+      - name: obs_date
+        description: Дата
+        data_tests:
+          - unique:
+              name: openmeteo_daily_key
+              description: В staging.openmeteo_daily одна строка на дату
+              config:
+                severity: error
+      - name: weather_code
+        description: Код погоды ВМО
+        data_tests:
+          - relationships:
+              name: weather_code_known
+              description: Код погоды есть в справочнике core.dim_weather_code
+              arguments:
+                to: ref('dim_weather_code')
+                field: code
+      - name: response_id
+        description: Ответ в raw.openmeteo_archive, из которого взята строка
+
+  - name: meteostat_daily
+    description: Meteostat, станция 27612 по дням. Будущие даты из файла (прогноз DWD MOSMIX) отброшены
+    columns:
+      - name: obs_date
+        description: Дата
+        data_tests:
+          - unique:
+              name: meteostat_daily_key
+              description: В staging.meteostat_daily одна строка на дату
+              config:
+                severity: error
+      - name: is_model_temp
+        description: Температура взята только из модели DWD MOSMIX, а не из наблюдений
+      - name: file_id
+        description: Файл в raw.meteostat_file, из которого взята строка
+
+  - name: openmeteo_forecast
+    description: Прогнозы Open-Meteo по датам выпуска
+
+  - name: station
+    description: Описание станции из настроек (config/settings.yaml)

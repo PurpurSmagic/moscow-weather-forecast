@@ -1,0 +1,97 @@
+version: 2
+
+# История изменений (SCD2). При каждом запуске dbt сравнивает текущие данные с последней
+# версией: если значения изменились, старая версия закрывается (заполняется valid_to)
+# и добавляется новая. Текущая версия — та, у которой valid_to пустой.
+
+snapshots:
+  - name: dim_station
+    relation: ref('station')
+    description: >
+      Справочник метеостанций с историей изменений: одна строка — одна версия описания станции.
+      Если в настройках поменяются название, координаты или высота, появится новая версия.
+    config:
+      schema: core
+      unique_key: station_id
+      strategy: check
+      check_cols: [wmo_id, name, latitude, longitude, elevation_m]
+      snapshot_meta_column_names:
+        dbt_scd_id: station_key
+        dbt_valid_from: valid_from
+        dbt_valid_to: valid_to
+        dbt_updated_at: updated_at
+    columns:
+      - name: station_key
+        description: Номер версии станции (на него ссылаются факты)
+      - name: station_id
+        description: Код станции (индекс ВМО), одинаковый у всех версий
+        data_tests:
+          - unique:
+              name: station_one_current_version
+              description: У каждой станции ровно одна текущая версия в справочнике
+              config:
+                severity: error
+                where: valid_to is null
+      - name: valid_from
+        description: С какого момента действует версия
+      - name: valid_to
+        description: До какого момента действовала версия; пусто — текущая версия
+
+  - name: fact_weather_daily
+    relation: ref('weather_daily_golden')
+    description: >
+      Погода по дням для станции. Хранятся все версии: если источник уточнил данные за день,
+      старая версия закрывается (valid_to), добавляется новая.
+    config:
+      schema: core
+      unique_key: [station_id, obs_date]
+      strategy: check
+      check_cols: [row_hash]
+      snapshot_meta_column_names:
+        dbt_scd_id: version_id
+        dbt_valid_from: valid_from
+        dbt_valid_to: valid_to
+        dbt_updated_at: updated_at
+    columns:
+      - name: version_id
+        description: Идентификатор версии записи
+      - name: station_key
+        description: Версия станции, текущая на момент создания записи
+        data_tests:
+          - relationships:
+              name: fact_station_ref
+              description: Каждая запись ссылается на существующую версию своей станции
+              arguments:
+                to: ref('dim_station')
+                field: station_key
+              config:
+                severity: error
+      - name: temp_mean
+        description: Среднесуточная температура, °C
+        data_tests:
+          - not_null:
+              name: fact_temp_present
+              description: У каждого дня есть среднесуточная температура
+              config:
+                severity: error
+                where: valid_to is null
+      - name: temp_source
+        description: >
+          station — значение станции (Meteostat); openmeteo_adjusted — Open-Meteo с поправкой
+          на смещение, если у станции нет наблюдения
+        data_tests:
+          - accepted_values:
+              name: fact_temp_source_allowed
+              description: Источник температуры — станция или Open-Meteo с поправкой
+              arguments:
+                values: [station, openmeteo_adjusted]
+              config:
+                severity: error
+      - name: row_hash
+        description: MD5 значимых полей — по нему определяется, изменилась ли запись
+      - name: transform_run_id
+        description: Запуск обработки, который создал эту версию
+      - name: valid_from
+        description: С какого момента действует версия
+      - name: valid_to
+        description: До какого момента действовала версия; пусто — текущая версия

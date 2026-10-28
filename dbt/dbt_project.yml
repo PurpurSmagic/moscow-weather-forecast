@@ -1,0 +1,72 @@
+# Обработка данных: raw -> staging -> core -> mart.
+# Модели — SQL-файлы в models/, история изменений — snapshots/, справочник кодов погоды —
+# seeds/, проверки качества — tests/ и описания моделей (*.yml).
+# Запускается командой `python -m weather transform`: она передаёт сюда параметры
+# из config/settings.yaml (vars ниже — значения по умолчанию для запуска dbt вручную).
+
+name: weather
+version: "1.0.0"
+config-version: 2
+profile: weather
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+snapshot-paths: ["snapshots"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+target-path: target
+clean-targets: ["target", "logs"]
+
+flags:
+  send_anonymous_usage_stats: false
+
+vars:
+  station_id: "27612"
+  station_name: "Москва, ВДНХ"
+  station_latitude: 55.8314
+  station_longitude: 37.6222
+  station_elevation_m: 147
+  timezone: Europe/Moscow
+  history_start: "1991-01-01"
+  heating_threshold_c: 8.0
+  heating_days: 5
+  ice_threshold_c: 0.0
+  norm_from_year: 1991
+  norm_to_year: 2020
+  bias_from: "1991-01-01"
+  bias_to: "2024-12-31"
+  transform_run_id: 0   # номер запуска в meta.transform_run (0 — запуск dbt вручную)
+
+models:
+  weather:
+    +persist_docs:   # описания из *.yml записываются в комментарии таблиц и колонок
+      relation: true
+      columns: true
+    staging:
+      +schema: staging
+      +materialized: table
+    core:
+      +schema: core
+      +materialized: table
+    mart:
+      +schema: mart
+      +materialized: table
+
+seeds:
+  weather:
+    +schema: core
+    +persist_docs:
+      relation: true
+      columns: true
+
+snapshots:
+  weather:
+    +persist_docs:
+      relation: true
+      columns: true
+
+# Проверки качества. По умолчанию нарушение — предупреждение (warn);
+# критичные проверки помечены severity: error — при их нарушении следующие шаги не выполняются.
+data_tests:
+  weather:
+    +severity: warn

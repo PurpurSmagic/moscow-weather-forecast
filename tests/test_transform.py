@@ -1,13 +1,16 @@
-"""Преобразования raw -> staging -> core -> mart на настоящей базе с подменёнными источниками."""
+"""Обработка raw -> staging -> core -> mart (проект dbt) на настоящей базе с подменёнными источниками."""
 
+import json
+import shutil
 from dataclasses import replace
 from datetime import timedelta
 
 import pytest
 from fakes import FakeHttp
 
+from weather.config import load_settings
 from weather.ingest.runner import run_ingest, today_in
-from weather.transform import TransformError, discover_steps, run_transform
+from weather.transform import DBT_DIR, TransformError, dbt_vars, load_manifest, run_transform
 
 
 def setup(fresh_db, days_of_history=20):
@@ -29,16 +32,27 @@ def one(conn, sql, *params):
 # --- без базы ---------------------------------------------------------------------
 
 
-def test_project_steps_have_targets():
-    steps = discover_steps()
-    assert [s.name[:2] for s in steps] == sorted(s.name[:2] for s in steps)
-    assert {s.target.split(".")[0] for s in steps} == {"staging", "core", "mart"}
+def test_settings_are_passed_to_dbt_as_vars():
+    settings = load_settings()
+    values = dbt_vars(settings, transform_run_id=7)
+    assert values["station_id"] == settings.station.wmo_id
+    assert values["heating_threshold_c"] == settings.heating.threshold_c
+    assert values["history_start"] == settings.history_start.isoformat()
+    assert values["transform_run_id"] == 7
+    json.dumps(values)  # передаются в dbt строкой JSON
 
 
-def test_step_without_target_is_rejected(tmp_path):
-    (tmp_path / "10_x.sql").write_text("SELECT 1;", encoding="utf-8")
-    with pytest.raises(TransformError, match="target"):
-        discover_steps(tmp_path)
+def test_project_layers():
+    pytest.importorskip("dbt", reason="dbt не установлен")
+    manifest = load_manifest(load_settings())
+    schemas = {}
+    for node in manifest.nodes.values():
+        if node.resource_type in ("model", "seed", "snapshot") and node.config.materialized != "ephemeral":
+            schemas.setdefault(node.schema, set()).add(node.alias)
+    assert set(schemas) == {"staging", "core", "mart"}
+    assert {"openmeteo_daily", "meteostat_daily", "quarantine"} <= schemas["staging"]
+    assert {"fact_weather_daily", "dim_station", "dim_date", "dim_weather_code"} <= schemas["core"]
+    assert schemas["mart"] == {"weather_daily", "forecast_latest", "climate_norm"}
 
 
 # --- на базе ----------------------------------------------------------------------
@@ -52,12 +66,16 @@ def test_layers_are_filled_and_rerun_adds_no_versions(fresh_db):
     assert rows["core.fact_weather_daily"] == 20
     assert rows["mart.weather_daily"] == 20
     assert rows["mart.forecast_latest"] == 8
-    assert one(conn, "SELECT count(*) FROM core.dim_station")[0] == 1
+    assert rows["core.dim_station"] == 1
+    assert {s.status for s in result.steps} == {"success"}
 
     run_transform(settings, conn)
     assert one(conn, "SELECT count(*) FROM core.fact_weather_daily")[0] == 20  # новых версий нет
+    assert one(conn, "SELECT count(*) FROM core.fact_forecast")[0] == 8  # выпуск прогноза не повторился
     statuses = conn.execute("SELECT status FROM meta.transform_run ORDER BY transform_run_id").fetchall()
     assert statuses == [("success",), ("success",)]
+    sql = "SELECT count(*) FROM meta.transform_step WHERE transform_run_id = %s"
+    assert one(conn, sql, result.transform_run_id)[0] == len(result.steps)
 
 
 def test_station_first_gaps_filled_from_openmeteo_with_bias(fresh_db):
@@ -95,16 +113,19 @@ def test_changed_source_value_creates_new_version(fresh_db):
     load(settings, conn, today, file_version="v2", station_temps={day: 7.0})
 
     versions = conn.execute(
-        "SELECT temp_mean, is_current, valid_from, valid_to FROM core.fact_weather_daily "
-        "WHERE obs_date = %s ORDER BY version_id",
+        "SELECT temp_mean, valid_from, valid_to, transform_run_id FROM core.fact_weather_daily "
+        "WHERE obs_date = %s ORDER BY valid_from",
         (day,),
     ).fetchall()
     assert len(versions) == 2
     old, new = versions
-    assert float(old[0]) == 5.0 and old[1] is False and old[3] is not None
-    assert float(new[0]) == 7.0 and new[1] is True and new[3] is None
+    assert float(old[0]) == 5.0 and old[2] is not None
+    assert float(new[0]) == 7.0 and new[2] is None
+    assert new[3] > old[3]  # новую версию создал второй запуск
     # остальные даты не изменились — у них по одной версии
     assert one(conn, "SELECT count(*) FROM core.fact_weather_daily")[0] == 21
+    # в витрине — только текущие версии
+    assert float(one(conn, "SELECT temp_mean FROM mart.weather_daily WHERE obs_date = %s", day)[0]) == 7.0
 
 
 def test_heating_streak_and_forecast_continue_actual_series(fresh_db):
@@ -125,13 +146,9 @@ def test_heating_streak_and_forecast_continue_actual_series(fresh_db):
         ).fetchall()
     )
     assert [actual[d[i]] for i in range(8, 0, -1)] == [1, 0, 1, 2, 3, 4, 5, 6]
-    assert (
-        one(conn, "SELECT heating_condition_met FROM mart.weather_daily WHERE obs_date = %s", d[2])[0] is True
-    )
-    assert (
-        one(conn, "SELECT heating_condition_met FROM mart.weather_daily WHERE obs_date = %s", d[3])[0]
-        is False
-    )
+    met = "SELECT heating_condition_met FROM mart.weather_daily WHERE obs_date = %s"
+    assert one(conn, met, d[2])[0] is True
+    assert one(conn, met, d[3])[0] is False
 
     rows = conn.execute(
         "SELECT target_date, cold_streak_days, ice_risk FROM mart.forecast_latest ORDER BY target_date"
@@ -143,27 +160,35 @@ def test_heating_streak_and_forecast_continue_actual_series(fresh_db):
     assert {r[0]: r[2] for r in rows}[today + timedelta(days=3)] is True  # 0 °C внутри суток и осадки
 
 
-def test_failed_step_rolls_back_everything(fresh_db, tmp_path):
+def test_failed_step_skips_dependent_steps(fresh_db, tmp_path):
     settings, conn, today = setup(fresh_db)
     load(settings, conn, today)
-    before = one(conn, "SELECT count(*) FROM staging.openmeteo_forecast")[0]
+    before = one(conn, "SELECT count(*), max(obs_date) FROM mart.weather_daily")
 
-    (tmp_path / "10_clear.sql").write_text(
-        "-- target: staging.openmeteo_forecast\nTRUNCATE staging.openmeteo_forecast;", encoding="utf-8"
+    # копия проекта dbt, где модель поправки по месяцам сломана
+    project = tmp_path / "dbt"
+    shutil.copytree(DBT_DIR, project, ignore=shutil.ignore_patterns("target", "logs"))
+    (project / "models" / "core" / "source_bias_monthly.sql").write_text(
+        "select * from no_such_table", encoding="utf-8"
     )
-    (tmp_path / "20_broken.sql").write_text(
-        "-- target: staging.openmeteo_forecast\nSELECT * FROM no_such_table;", encoding="utf-8"
-    )
-    with pytest.raises(TransformError, match="20_broken"):
-        run_transform(settings, conn, directory=tmp_path)
+    with pytest.raises(TransformError, match="source_bias_monthly") as error:
+        run_transform(settings, conn, project_dir=project)
 
-    assert one(conn, "SELECT count(*) FROM staging.openmeteo_forecast")[0] == before  # TRUNCATE откатился
-    status, error = one(
+    steps = {s.step: s.status for s in error.value.steps}
+    assert steps["source_bias_monthly"] == "failed"
+    assert steps["openmeteo_daily"] == "success"  # не зависит от сломанного шага
+    assert steps["fact_weather_daily"] == steps["weather_daily"] == "skipped"
+    # витрина не менялась
+    assert one(conn, "SELECT count(*), max(obs_date) FROM mart.weather_daily") == before
+
+    status, error_text = one(
         conn, "SELECT status, error_message FROM meta.transform_run ORDER BY transform_run_id DESC LIMIT 1"
     )
-    assert status == "failed" and "no_such_table" in error
-    steps = conn.execute(
-        "SELECT step, status FROM meta.transform_step WHERE transform_run_id = "
-        "(SELECT max(transform_run_id) FROM meta.transform_run) ORDER BY step"
-    ).fetchall()
-    assert steps == [("10_clear", "success"), ("20_broken", "failed")]
+    assert status == "failed" and "no_such_table" in error_text
+    saved = dict(
+        conn.execute(
+            "SELECT step, status FROM meta.transform_step WHERE transform_run_id = "
+            "(SELECT max(transform_run_id) FROM meta.transform_run)"
+        ).fetchall()
+    )
+    assert saved == steps

@@ -14,6 +14,7 @@ RUN pip install -r requirements.txt -r requirements-dev.txt
 
 COPY src ./src
 COPY sql ./sql
+COPY dbt ./dbt
 COPY config ./config
 COPY tests ./tests
 

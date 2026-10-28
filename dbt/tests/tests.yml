@@ -1,0 +1,125 @@
+version: 2
+
+# Описание проверок качества данных (SQL — в файлах с тем же названием).
+# Каждая проверка — запрос, который возвращает строки-нарушения: пустой результат — проверка пройдена.
+#   check_type — тип проверки: полнота, уникальность, допустимость значений, соответствие типов,
+#                соответствие диапазонам, ссылочная целостность, актуальность, сверка источников;
+#   severity   — warn: записать результат и продолжить; error: критично, следующие шаги
+#                обработки не выполняются, витрины остаются как были;
+#   level: quarantine — нарушения не просто записываются: такие строки убраны в staging.quarantine;
+#   table      — какую таблицу показывать в результатах (по умолчанию — первая таблица из запроса).
+# Проверки на ключи и ссылки (unique, not_null, relationships, accepted_values) описаны
+# рядом с моделями — в models/*/*.yml и snapshots/snapshots.yml.
+
+data_tests:
+
+  # ---------------------------------------------------------------- staging
+
+  - name: openmeteo_not_empty
+    description: Есть данные Open-Meteo для обработки
+    config:
+      severity: error
+      meta: {check_type: полнота}
+
+  - name: openmeteo_temp_range
+    description: Температура Open-Meteo в пределах от −50 до +45 °C
+    config:
+      meta: {check_type: соответствие диапазонам, level: quarantine}
+
+  - name: openmeteo_temp_order
+    description: У Open-Meteo t мин ≤ t ср ≤ t макс (допуск 0,5 °C)
+    config:
+      meta: {check_type: допустимость значений, level: quarantine}
+
+  - name: meteostat_temp_range
+    description: Температура станции в пределах от −50 до +45 °C
+    config:
+      meta: {check_type: соответствие диапазонам, level: quarantine}
+
+  - name: meteostat_temp_order
+    description: У станции t мин ≤ t ср ≤ t макс (допуск 0,5 °C)
+    config:
+      meta: {check_type: допустимость значений, level: quarantine}
+
+  - name: openmeteo_values_allowed
+    description: >
+      Влажность и облачность 0–100 %, направление ветра 0–360°, осадки и ветер не меньше 0,
+      давление 940–1070 гПа
+    config:
+      meta: {check_type: допустимость значений}
+
+  - name: meteostat_values_allowed
+    description: Влажность 0–100 %, облачность 0–8 окт, осадки 0–300 мм, снег 0–150 см, давление 940–1070 гПа
+    config:
+      meta: {check_type: допустимость значений}
+
+  - name: raw_openmeteo_types
+    description: В ответах Open-Meteo значения — числа или пусто
+    config:
+      meta: {check_type: соответствие типов}
+
+  - name: raw_meteostat_types
+    description: В файлах Meteostat числовые колонки содержат числа
+    config:
+      meta: {check_type: соответствие типов}
+
+  # ---------------------------------------------------------------- core и витрины
+
+  - name: fact_dates_complete
+    description: В ряду по дням нет пропущенных дат (от начала истории до последнего дня)
+    config:
+      meta: {check_type: полнота}
+
+  - name: fact_one_current_version
+    description: На каждую дату ровно одна текущая версия записи
+    config:
+      severity: error
+      meta: {check_type: уникальность}
+
+  - name: forecast_one_issue
+    description: В витрине прогноза у каждой модели один выпуск и одна строка на дату
+    config:
+      severity: error
+      meta: {check_type: уникальность}
+
+  - name: fact_raw_ref
+    description: Каждая текущая запись ссылается на корректный ответ или файл источника
+    config:
+      severity: error
+      meta: {check_type: ссылочная целостность, table: core.fact_weather_daily}
+
+  - name: mart_matches_core
+    description: В витрине ровно те же даты, что и в core
+    config:
+      severity: error
+      meta: {check_type: ссылочная целостность, table: mart.weather_daily}
+
+  - name: fresh_actual
+    description: Фактические данные не старше двух дней
+    config:
+      meta: {check_type: актуальность}
+
+  - name: fresh_forecast
+    description: Прогноз Open-Meteo выпущен сегодня
+    config:
+      meta: {check_type: актуальность}
+
+  - name: fresh_loads
+    description: Каждый источник успешно загружался в последние 2 дня
+    config:
+      meta: {check_type: актуальность}
+
+  - name: sources_agree
+    description: Станция и Open-Meteo (с поправкой на смещение) расходятся не больше чем на 5 °C
+    config:
+      meta: {check_type: сверка источников}
+
+  - name: temp_jump
+    description: Среднесуточная температура не меняется больше чем на 15 °C за сутки
+    config:
+      meta: {check_type: соответствие диапазонам}
+
+  - name: source_schema_changed
+    description: Источники не меняли формат данных за последнюю неделю (реестр схем)
+    config:
+      meta: {check_type: соответствие типов}

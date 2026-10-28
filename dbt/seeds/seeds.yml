@@ -1,0 +1,25 @@
+version: 2
+
+seeds:
+  - name: dim_weather_code
+    description: Коды погодных явлений ВМО (WMO 4677, в варианте Open-Meteo)
+    config:
+      column_types:
+        code: smallint
+        description: text
+        category: text
+        is_precipitation: boolean
+        is_freezing: boolean
+    columns:
+      - name: code
+        description: Код погоды
+        data_tests:
+          - unique:
+              name: weather_code_unique
+              description: Коды в справочнике кодов погоды не повторяются
+              config:
+                severity: error
+      - name: is_precipitation
+        description: Есть осадки
+      - name: is_freezing
+        description: Переохлаждённые осадки — прямой признак гололёда

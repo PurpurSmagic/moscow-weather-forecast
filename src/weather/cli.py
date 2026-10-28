@@ -3,10 +3,11 @@
 python -m weather run       — полный цикл: миграции, загрузка, обработка
 python -m weather migrate   — применить новые миграции схемы БД
 python -m weather ingest    — загрузить новые данные из источников
-python -m weather transform — обработать данные: raw -> staging -> core -> mart
+python -m weather transform — обработать данные: raw -> staging -> core -> mart (dbt build)
 python -m weather show      — погода за последние дни, прогноз и признаки для решений
 python -m weather loads     — журнал последних загрузок и отметки загрузки
-python -m weather dq        — проверки качества данных (без изменения данных)
+python -m weather dq        — проверки качества данных (dbt test, без изменения данных)
+python -m weather docs      — документация dbt: описание таблиц и схема зависимостей (lineage)
 python -m weather check     — проверить настройки, подключение, слои, миграции и источники
 
 Коды возврата: 0 — успешно, 1 — ошибка, загрузка с ошибками или не прошла критичная
@@ -52,7 +53,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     ingest.add_argument("--trigger", choices=("manual", "schedule"), default="manual", help="кто запустил")
 
-    commands.add_parser("transform", help="обработать данные: raw -> staging -> core -> mart")
+    commands.add_parser("transform", help="обработать данные: raw -> staging -> core -> mart (dbt build)")
 
     show = commands.add_parser("show", help="погода за последние дни, прогноз и признаки для решений")
     show.add_argument("--days", type=int, default=7, help="сколько последних дней факта показать")
@@ -60,9 +61,13 @@ def main(argv: list[str] | None = None) -> int:
     loads = commands.add_parser("loads", help="журнал последних загрузок и отметки загрузки")
     loads.add_argument("--limit", type=int, default=15, help="сколько последних загрузок показать")
 
-    dq = commands.add_parser("dq", help="проверки качества данных (без изменения данных)")
-    dq.add_argument("--phase", choices=("staging", "final"), help="только правила этого этапа")
+    dq = commands.add_parser("dq", help="проверки качества данных (dbt test, без изменения данных)")
+    dq.add_argument("--select", help="только эти проверки (имя проверки или правило выбора dbt)")
     dq.add_argument("--all", action="store_true", help="показать и пройденные проверки")
+
+    docs = commands.add_parser("docs", help="документация dbt и схема зависимостей таблиц (lineage)")
+    docs.add_argument("--port", type=int, default=8080, help="порт веб-страницы документации")
+    docs.add_argument("--no-serve", action="store_true", help="только собрать документацию, не открывать")
 
     commands.add_parser("check", help="проверить настройки, подключение, слои, миграции и источники")
     args = parser.parse_args(argv)
@@ -83,6 +88,7 @@ def main(argv: list[str] | None = None) -> int:
         "show": cmd_show,
         "loads": cmd_loads,
         "dq": cmd_dq,
+        "docs": cmd_docs,
         "check": cmd_check,
     }
     try:
@@ -117,43 +123,52 @@ def cmd_transform(settings: Settings, args: argparse.Namespace) -> int:
         try:
             result = run_transform(settings, conn)
         except TransformError as exc:
+            if exc.steps:
+                print("\nШаги (после ошибки зависящие шаги не выполнялись, их таблицы не менялись):")
+                _print_steps(exc.steps)
             if exc.checks:
-                print("\nПроверки качества (изменения отменены, витрины не менялись):")
+                print("\nПроверки качества:")
                 _print_checks(exc.checks, show_passed=False)
             raise
     print(f"\nПреобразование №{result.transform_run_id}: {result.status}")
-    print(
-        _table(
-            ["шаг", "таблица", "строк", "время, мс"],
-            [[s.step, s.target, s.rows_after, s.duration_ms] for s in result.steps],
-        )
-    )
+    _print_steps(result.steps)
     print("\nПроверки качества:")
     _print_checks(result.checks, show_passed=False)
     return 0
 
 
-def cmd_dq(settings: Settings, args: argparse.Namespace) -> int:
-    """Проверки по текущим данным: ничего не меняет, результаты пишет в meta.dq_result."""
-    from weather import db, dq
-    from weather.config import today_in
-    from weather.transform import session_params, set_params
+def _print_steps(steps: list[Any]) -> None:
+    types = {"model": "модель", "seed": "справочник", "snapshot": "история"}
+    statuses = {"success": "ок", "failed": "ошибка", "skipped": "пропущен"}
+    print(
+        _table(
+            ["шаг", "тип", "таблица", "статус", "строк", "время, мс"],
+            [
+                [s.step, types.get(s.node_type, s.node_type), s.target, statuses.get(s.status, s.status),
+                 "" if s.rows_after is None else s.rows_after, s.duration_ms]
+                for s in steps
+            ],
+        )
+    )  # fmt: skip
 
-    rules = dq.load_rules()
+
+def cmd_dq(settings: Settings, args: argparse.Namespace) -> int:
+    """Проверки по текущим данным (dbt test): ничего не меняет, результаты пишет в meta.dq_result."""
+    from weather import db, dq
+    from weather.transform import run_checks
+
     with db.connect(settings.db, autocommit=True) as conn:
-        if not conn.execute("SELECT to_regclass('meta.dq_result') IS NOT NULL").fetchone()[0]:
-            print("Таблиц для проверок ещё нет — сначала выполните: python -m weather migrate")
+        if not conn.execute("SELECT to_regclass('mart.weather_daily') IS NOT NULL").fetchone()[0]:
+            print("Таблиц для проверок ещё нет — сначала выполните: python -m weather run")
             return 1
-        with conn.transaction():
-            set_params(conn, session_params(settings, None, today_in(settings.timezone)))
-            checks = dq.run_checks(conn, rules, args.phase)
+        checks = run_checks(settings, conn, select=args.select)
         dq.save_results(conn, checks, None)
         quarantine = conn.execute(
             "SELECT rule_code, source_table, count(*), min(row_key), max(row_key) "
             "FROM staging.quarantine GROUP BY rule_code, source_table ORDER BY rule_code"
         ).fetchall()
 
-    print(f"Проверки качества данных ({len(checks)} правил):")
+    print(f"\nПроверки качества данных ({len(checks)}):")
     _print_checks(checks, show_passed=args.all)
     if quarantine:
         print("\nВ карантине после последней обработки:")
@@ -166,6 +181,22 @@ def cmd_dq(settings: Settings, args: argparse.Namespace) -> int:
     return 1 if dq.blocking(checks) else 0
 
 
+def cmd_docs(settings: Settings, args: argparse.Namespace) -> int:
+    """Документация dbt: описания таблиц и колонок, тесты и граф зависимостей (lineage)."""
+    from weather.transform import DBT_DIR, run_dbt
+
+    run = run_dbt(settings, ["docs", "generate"])
+    if not run.success:
+        log.error("Документация не собрана: %s", run.error)
+        return 1
+    print(f"Документация собрана: {DBT_DIR / 'target' / 'index.html'}")
+    if args.no_serve:
+        return 0
+    print(f"Откройте в браузере http://localhost:{args.port} (остановить — Ctrl+C)")
+    run_dbt(settings, ["docs", "serve", "--host", "0.0.0.0", "--port", str(args.port), "--no-browser"])
+    return 0
+
+
 def _print_checks(checks: list[Any], show_passed: bool) -> None:
     from weather import dq
 
@@ -173,7 +204,7 @@ def _print_checks(checks: list[Any], show_passed: bool) -> None:
     shown = [c for c in checks if show_passed or c.status != "passed"]
     if not shown:
         return
-    status_names = {"passed": "ок", "failed": "нарушения", "error": "ошибка"}
+    status_names = {"passed": "ок", "failed": "нарушения", "error": "ошибка", "skipped": "не выполнялась"}
     print(
         _table(
             ["правило", "тип", "уровень", "статус", "строк", "пример / сообщение"],
@@ -406,6 +437,8 @@ def cmd_check(settings: Settings, args: argparse.Namespace) -> int:
         f"порог отопления +{settings.heating.threshold_c:g} °C × {settings.heating.consecutive_days} сут."
     )
 
+    print(f"Обработка: dbt {_dbt_version()} (проект в каталоге dbt/)")
+
     db.wait_for_db(settings.db, timeout_s=15)
     with db.connect(settings.db, autocommit=True) as conn:
         version = conn.execute("SHOW server_version").fetchone()[0]
@@ -442,6 +475,15 @@ def cmd_check(settings: Settings, args: argparse.Namespace) -> int:
 
 
 # --- вспомогательное ------------------------------------------------------------
+
+
+def _dbt_version() -> str:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("dbt-core")
+    except PackageNotFoundError:
+        return "не установлен"
 
 
 def _sources_status(conn: Any, settings: Settings) -> list[str]:

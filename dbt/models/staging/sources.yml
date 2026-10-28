@@ -1,0 +1,21 @@
+version: 2
+
+# Таблицы, которые заполняет загрузка (python -m weather ingest). dbt их только читает.
+sources:
+  - name: raw
+    description: Ответы источников без изменений
+    tables:
+      - name: openmeteo_archive
+        description: Ответы Open-Meteo Historical Weather API (JSON), история по дням
+      - name: openmeteo_forecast
+        description: Ответы Open-Meteo Forecast API (JSON), один корректный ответ на дату выпуска
+      - name: meteostat_file
+        description: Годовые CSV-файлы Meteostat по станции 27612 (ВДНХ)
+
+  - name: meta
+    description: Служебные таблицы загрузки
+    tables:
+      - name: load_log
+        description: Журнал загрузок по источникам
+      - name: source_schema
+        description: Реестр схем источников (какие поля приходили и когда)

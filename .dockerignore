@@ -13,3 +13,5 @@ venv
 data
 *.bundle
 docs
+dbt/target
+dbt/logs

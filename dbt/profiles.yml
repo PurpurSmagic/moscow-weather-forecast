@@ -1,0 +1,15 @@
+# Подключение dbt к базе. Значения берутся из тех же переменных окружения, что и у приложения
+# (их задаёт docker-compose.yml или файл .env).
+weather:
+  target: default
+  outputs:
+    default:
+      type: postgres
+      host: "{{ env_var('POSTGRES_HOST', 'localhost') }}"
+      port: "{{ env_var('POSTGRES_PORT', '5433') | as_number }}"
+      user: "{{ env_var('POSTGRES_USER', 'weather') }}"
+      password: "{{ env_var('POSTGRES_PASSWORD', 'change_me') }}"
+      dbname: "{{ env_var('POSTGRES_DB', 'weather') }}"
+      schema: mart
+      threads: 4
+      connect_timeout: 10

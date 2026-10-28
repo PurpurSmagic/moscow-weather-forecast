@@ -1,0 +1,32 @@
+version: 2
+
+models:
+  - name: dim_date
+    description: "Календарь: атрибуты даты для разрезов в витринах и дашбордах"
+    columns:
+      - name: date_value
+        description: Дата
+        data_tests:
+          - unique:
+              name: dim_date_key
+              description: В календаре каждая дата один раз
+              config:
+                severity: error
+      - name: day_of_week
+        description: День недели, 1 = понедельник
+
+  - name: source_bias_monthly
+    description: >
+      Среднее (станция Meteostat − Open-Meteo) по месяцам за опорный период:
+      поправка при заполнении пропусков станции
+
+  - name: weather_daily_golden
+    description: >
+      Сведённая запись на дату из двух источников (без истории). Из неё снапшот
+      core.fact_weather_daily делает историю версий
+
+  - name: fact_forecast
+    description: Прогнозы по датам выпуска (Open-Meteo, потом — собственные модели)
+    columns:
+      - name: lead_days
+        description: Заблаговременность прогноза, сутки

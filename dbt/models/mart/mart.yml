@@ -1,0 +1,40 @@
+version: 2
+
+models:
+  - name: climate_norm
+    description: Климатическая норма температуры и осадков по дню года (сглаживание ±7 дней)
+    columns:
+      - name: day_of_year
+        description: День года
+        data_tests:
+          - unique:
+              name: climate_norm_key
+              description: В норме одна строка на день года
+              config:
+                severity: error
+
+  - name: weather_daily
+    description: "Фактическая погода по дням: норма, отклонение, признаки отопления и гололёда"
+    columns:
+      - name: obs_date
+        description: Дата
+        data_tests:
+          - unique:
+              name: weather_daily_key
+              description: В витрине одна строка на дату
+              config:
+                severity: error
+      - name: cold_streak_days
+        description: Сколько дней подряд (включая этот) среднесуточная температура ниже порога отопления
+      - name: heating_condition_met
+        description: "Выполнено условие начала отопления: не меньше заданного числа дней подряд ниже порога"
+      - name: ice_risk
+        description: "Риск гололёда: переход через 0 °C при осадках или переохлаждённые осадки"
+
+  - name: forecast_latest
+    description: Последний выпуск прогноза каждой модели. Серия холодных дней продолжает фактическую серию
+    columns:
+      - name: bias_correction
+        description: >
+          Поправка, добавленная к температуре прогноза Open-Meteo, чтобы привести его к станции
+          (как при заполнении пропусков в core.fact_weather_daily)
