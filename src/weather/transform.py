@@ -192,17 +192,25 @@ def _status(run_result: Any) -> str:
 # --- обработка --------------------------------------------------------------------
 
 
-def run_transform(settings: Settings, conn: Any, *, project_dir: Path = DBT_DIR) -> TransformResult:
-    """Запускает `dbt build` и записывает журнал. Подключение должно быть в режиме autocommit."""
+def run_transform(
+    settings: Settings, conn: Any, *, project_dir: Path = DBT_DIR, select: str | None = None
+) -> TransformResult:
+    """Запускает `dbt build` и записывает журнал. Подключение должно быть в режиме autocommit.
+
+    select — выполнить только часть шагов (правило выбора dbt), например витрины,
+    которые зависят от прогнозов моделей."""
     run_id = conn.execute(
         "INSERT INTO meta.transform_run DEFAULT VALUES RETURNING transform_run_id"
     ).fetchone()[0]
-    log.info("Преобразование №%d: dbt build (%s)", run_id, project_dir)
+    log.info(
+        "Преобразование №%d: dbt build%s (%s)", run_id, f" --select {select}" if select else "", project_dir
+    )
 
     # Одновременно может идти только одна обработка
     conn.execute("SELECT pg_advisory_lock(%s)", (TRANSFORM_LOCK_KEY,))
     try:
-        run = run_dbt(settings, ["build"], transform_run_id=run_id, project_dir=project_dir)
+        command = ["build"] + (["--select", select] if select else [])
+        run = run_dbt(settings, command, transform_run_id=run_id, project_dir=project_dir)
         steps = [_step_result(conn, r) for r in run.results if r.node.resource_type in STEP_TYPES]
         tests = [r for r in run.results if r.node.resource_type == "test"]
         checks = [dq.check_result(conn, r, run.manifest) for r in tests]

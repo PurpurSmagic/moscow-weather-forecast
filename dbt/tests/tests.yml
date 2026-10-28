@@ -123,3 +123,9 @@ data_tests:
     description: Источники не меняли формат данных за последнюю неделю (реестр схем)
     config:
       meta: {check_type: соответствие типов}
+
+  - name: model_forecast_range
+    description: Прогноз собственных моделей в пределах от −50 до +45 °C
+    config:
+      meta: {check_type: соответствие диапазонам, table: core.model_forecast}
+

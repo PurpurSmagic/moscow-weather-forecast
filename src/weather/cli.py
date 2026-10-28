@@ -1,9 +1,11 @@
 """Командная строка проекта.
 
-python -m weather run       — полный цикл: миграции, загрузка, обработка
+python -m weather run       — полный цикл: миграции, загрузка, обработка, прогноз
 python -m weather migrate   — применить новые миграции схемы БД
 python -m weather ingest    — загрузить новые данные из источников
 python -m weather transform — обработать данные: raw -> staging -> core -> mart (dbt build)
+python -m weather evaluate  — оценить качество моделей прогноза на истории
+python -m weather forecast  — построить прогноз моделями на 7 суток
 python -m weather show      — погода за последние дни, прогноз и признаки для решений
 python -m weather loads     — журнал последних загрузок и отметки загрузки
 python -m weather dq        — проверки качества данных (dbt test, без изменения данных)
@@ -39,7 +41,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", help="путь к YAML-файлу настроек (по умолчанию из WEATHER_CONFIG)")
     commands = parser.add_subparsers(dest="command", required=True, metavar="КОМАНДА")
 
-    run = commands.add_parser("run", help="полный цикл: миграции, загрузка и обработка данных")
+    run = commands.add_parser("run", help="полный цикл: миграции, загрузка, обработка данных и прогноз")
     run.add_argument("--trigger", choices=("manual", "schedule"), default="manual", help="кто запустил")
 
     commands.add_parser("migrate", help="применить новые миграции схемы БД")
@@ -54,6 +56,10 @@ def main(argv: list[str] | None = None) -> int:
     ingest.add_argument("--trigger", choices=("manual", "schedule"), default="manual", help="кто запустил")
 
     commands.add_parser("transform", help="обработать данные: raw -> staging -> core -> mart (dbt build)")
+    commands.add_parser(
+        "evaluate", help="оценить качество моделей прогноза на истории (обучение, проверка, тест)"
+    )
+    commands.add_parser("forecast", help="построить прогноз моделями на 7 суток и обновить витрины")
 
     show = commands.add_parser("show", help="погода за последние дни, прогноз и признаки для решений")
     show.add_argument("--days", type=int, default=7, help="сколько последних дней факта показать")
@@ -85,6 +91,8 @@ def main(argv: list[str] | None = None) -> int:
         "migrate": cmd_migrate,
         "ingest": cmd_ingest,
         "transform": cmd_transform,
+        "evaluate": cmd_evaluate,
+        "forecast": cmd_forecast,
         "show": cmd_show,
         "loads": cmd_loads,
         "dq": cmd_dq,
@@ -111,7 +119,28 @@ def cmd_run(settings: Settings, args: argparse.Namespace) -> int:
     # Обработка идёт, даже если какой-то источник не загрузился: используются данные,
     # загруженные раньше
     transform_code = cmd_transform(settings, args)
-    return ingest_code or transform_code
+    # Параметры моделей подбираются один раз — при первом запуске (дальше: команда evaluate)
+    if not _evaluated(settings):
+        from weather.forecast.journal import ForecastError
+
+        try:
+            cmd_evaluate(settings, args)
+        except ForecastError as exc:
+            log.warning("Оценка качества моделей пропущена: %s", exc)
+    # Прогноз по свежим данным; после него обновляются витрины с прогнозами
+    forecast_code = cmd_forecast(settings, args)
+    return ingest_code or transform_code or forecast_code
+
+
+def _evaluated(settings: Settings) -> bool:
+    """Была ли хотя бы одна успешная оценка качества моделей."""
+    from weather import db
+
+    with db.connect(settings.db, autocommit=True) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM meta.model_run WHERE kind = 'evaluate' AND status = 'success' LIMIT 1"
+        ).fetchone()
+    return row is not None
 
 
 def cmd_transform(settings: Settings, args: argparse.Namespace) -> int:
@@ -150,6 +179,95 @@ def _print_steps(steps: list[Any]) -> None:
             ],
         )
     )  # fmt: skip
+
+
+# Шаги dbt, которые зависят от моделей прогноза: общая таблица прогнозов и витрины
+FORECAST_MARTS = "source:forecast+ source:meta.model_run+"
+
+
+def cmd_evaluate(settings: Settings, args: argparse.Namespace) -> int:
+    from weather import db
+    from weather.forecast.evaluate import run_evaluate
+    from weather.forecast.models import MODEL_NAMES
+    from weather.transform import run_transform
+
+    db.wait_for_db(settings.db)
+    with db.connect(settings.db, autocommit=True) as conn:
+        result = run_evaluate(settings, conn)
+        run_transform(settings, conn, select=FORECAST_MARTS)
+
+    m = settings.models
+    print(f"\nОценка качества №{result.model_run_id}")
+    print(
+        f"  обучение — дни до {m.validation_from}; "
+        f"подбор параметров — с {m.validation_from} до {m.test_from};"
+    )
+    print(f"  тест — с {m.test_from} по {result.data_until}")
+    horizons = range(1, settings.forecast_horizon_days + 1)
+    threshold = {}
+    for x in result.metrics:
+        if x.split == "test":
+            threshold.setdefault(x.model_code, []).append(x.threshold_accuracy)
+    rows = []
+    for code, by_h in result.mae_table("test").items():
+        mean = sum(by_h.values()) / len(by_h)
+        acc = sum(threshold[code]) / len(threshold[code])
+        rows.append([MODEL_NAMES[code], *[f"{by_h[h]:.2f}" for h in horizons], f"{mean:.2f}", f"{acc:.0%}"])
+    print("\nСредняя абсолютная ошибка на тесте (MAE, °C) по горизонтам прогноза, сутки:")
+    print(
+        _table(
+            ["модель", *[str(h) for h in horizons], "среднее", f"порог {settings.heating.threshold_c:+g}°"],
+            rows,
+        )
+    )
+    print(
+        f"  порог {settings.heating.threshold_c:+g}° — доля дней, где прогноз и факт "
+        "по одну сторону порога отопления"
+    )
+
+    print("\nВыбранные параметры:")
+    for code, params in result.params.items():
+        shown = {k: v for k, v in params.items() if k != "n_estimators"}
+        if "n_estimators" in params:
+            trees = params["n_estimators"].values()
+            shown["деревьев"] = f"{min(trees)}–{max(trees)}"
+        print(f"  {MODEL_NAMES[code]}: " + (", ".join(f"{k}={v}" for k, v in shown.items()) or "нет"))
+    for code, values in result.importance.items():
+        top = ", ".join(
+            f"{k} ({v:+.2f})" if code == "ridge" else f"{k} ({v:.0%})" for k, v in list(values.items())[:5]
+        )
+        print(f"  главные признаки {MODEL_NAMES[code]}: {top}")
+    return 0
+
+
+def cmd_forecast(settings: Settings, args: argparse.Namespace) -> int:
+    from weather import db
+    from weather.forecast.models import MODEL_NAMES
+    from weather.forecast.predict import run_forecast
+    from weather.transform import run_transform
+
+    db.wait_for_db(settings.db)
+    with db.connect(settings.db, autocommit=True) as conn:
+        result = run_forecast(settings, conn)
+        run_transform(settings, conn, select=FORECAST_MARTS)
+
+    print(
+        f"\nПрогноз №{result.model_run_id}: выпуск {result.issue_date}, "
+        f"параметры моделей {result.params_source}"
+    )
+    if result.inserted == 0:
+        print("  прогноз с этой датой выпуска уже был — новых строк нет")
+    codes = settings.models.codes
+    table: dict[Any, dict[str, float]] = {}
+    for r in result.rows:
+        table.setdefault(r.target_date, {})[r.model_code] = r.temp_mean
+    print(
+        _table(
+            ["дата", *[MODEL_NAMES[c] for c in codes]],
+            [[d, *[values.get(c, "") for c in codes]] for d, values in sorted(table.items())],
+        )
+    )
+    return 0
 
 
 def cmd_dq(settings: Settings, args: argparse.Namespace) -> int:
@@ -249,6 +367,16 @@ def cmd_show(settings: Settings, args: argparse.Namespace) -> int:
             "heating_condition_met, ice_risk, weather_description, issue_date "
             "FROM mart.forecast_latest WHERE model_code = 'openmeteo' ORDER BY target_date"
         ).fetchall()
+        models = conn.execute(
+            "SELECT model_code, target_date, temp_mean, heating_condition_met FROM mart.forecast_latest "
+            "WHERE model_code <> 'openmeteo' ORDER BY target_date"
+        ).fetchall()
+        best = None
+        if conn.execute("SELECT to_regclass('mart.model_quality') IS NOT NULL").fetchone()[0]:
+            best = conn.execute(
+                "SELECT model_code, avg(mae) FROM mart.model_quality WHERE split = 'test' "
+                "GROUP BY model_code ORDER BY avg(mae) LIMIT 1"
+            ).fetchone()
     if not actual:
         print("Витрины пустые — сначала выполните: python -m weather run")
         return 1
@@ -280,6 +408,9 @@ def cmd_show(settings: Settings, args: argparse.Namespace) -> int:
             )
         )
 
+    if models:
+        _print_model_forecast(models, forecast)
+
     print()
     streak, met = actual[0][5], actual[0][6]
     if met:
@@ -293,11 +424,39 @@ def cmd_show(settings: Settings, args: argparse.Namespace) -> int:
             print(f"  По прогнозу условие выполнится {heat_day}.")
         elif forecast:
             print("  По прогнозу на неделю условие не выполнится.")
+        if best and not met:
+            from weather.forecast.models import MODEL_NAMES
+
+            day = next((d for code, d, _, heat in models if code == best[0] and heat), None)
+            verdict = f"выполнится {day}" if day else "на неделю не выполнится"
+            print(
+                f"  По лучшей модели ({MODEL_NAMES.get(best[0], best[0])}, средняя ошибка на тесте "
+                f"{float(best[1]):.1f} °C) условие {verdict}."
+            )
     ice_days = [str(row[0]) for row in forecast if row[7]]
     print(
         "Гололёд: " + (f"риск по прогнозу — {', '.join(ice_days)}." if ice_days else "по прогнозу риска нет.")
     )
     return 0
+
+
+def _print_model_forecast(models: list[Any], openmeteo: list[Any]) -> None:
+    """Таблица прогнозов среднесуточной температуры: Open-Meteo и собственные модели."""
+    from weather.forecast.models import MODEL_NAMES
+
+    codes = [c for c in MODEL_NAMES if any(row[0] == c for row in models)]
+    table: dict[Any, dict[str, Any]] = {}
+    for code, day, temp, _ in models:
+        table.setdefault(day, {})[code] = temp
+    for day, temp, *_ in openmeteo:
+        table.setdefault(day, {})["openmeteo"] = temp
+    print("\nПрогноз среднесуточной температуры моделями, °C:")
+    print(
+        _table(
+            ["дата", "Open-Meteo", *[MODEL_NAMES[c] for c in codes]],
+            [[d, v.get("openmeteo", ""), *[v.get(c, "") for c in codes]] for d, v in sorted(table.items())],
+        )
+    )
 
 
 def _signed(value: Any) -> str:

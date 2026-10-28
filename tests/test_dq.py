@@ -143,7 +143,8 @@ def test_critical_failure_stops_processing_and_keeps_results(fresh_db, tmp_path)
         run_transform(settings, conn, project_dir=project)
 
     assert any(c.rule.code == "always_fails" and c.status == "failed" for c in error.value.checks)
-    assert {s.status for s in error.value.steps if s.target.startswith("mart.")} == {"skipped"}
+    steps = {s.step: s.status for s in error.value.steps}
+    assert steps["weather_daily"] == steps["forecast_latest"] == "skipped"  # зависят от данных станции
     # витрина осталась как была
     assert one(conn, "SELECT temp_mean FROM mart.weather_daily WHERE obs_date = %s", day)[0] == before
     run_id, status = one(

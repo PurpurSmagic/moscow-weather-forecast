@@ -52,7 +52,8 @@ def test_project_layers():
     assert set(schemas) == {"staging", "core", "mart"}
     assert {"openmeteo_daily", "meteostat_daily", "quarantine"} <= schemas["staging"]
     assert {"fact_weather_daily", "dim_station", "dim_date", "dim_weather_code"} <= schemas["core"]
-    assert schemas["mart"] == {"weather_daily", "forecast_latest", "climate_norm"}
+    marts = {"weather_daily", "forecast_latest", "climate_norm", "forecast_error", "model_quality"}
+    assert schemas["mart"] == marts
 
 
 # --- на базе ----------------------------------------------------------------------

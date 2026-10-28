@@ -8,6 +8,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# libgomp — библиотека параллельных вычислений, без неё не запускается LightGBM
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
 # Сначала зависимости — этот слой кешируется и не пересобирается при правке кода
 COPY requirements.txt requirements-dev.txt ./
 RUN pip install -r requirements.txt -r requirements-dev.txt

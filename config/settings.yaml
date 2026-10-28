@@ -24,6 +24,13 @@ forecast:
   target: temperature_mean
   # На сколько суток вперёд строится прогноз
   horizon_days: 7
+  # Модели прогноза: persistence — «как вчера», climatology — климатическая норма
+  # (это базовые модели для сравнения), ridge — линейная регрессия, lightgbm — градиентный бустинг
+  models: [persistence, climatology, ridge, lightgbm]
+  # Проверка качества моделей (команда evaluate): обучение на днях до validation_from,
+  # подбор параметров на днях с validation_from до test_from, итоговая оценка — с test_from
+  validation_from: "2019-01-01"
+  test_from: "2022-01-01"
 
 # Пороговые правила, на которые опирается пользователь (служба ЖКХ)
 decision_rules:

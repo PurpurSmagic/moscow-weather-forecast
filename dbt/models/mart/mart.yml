@@ -38,3 +38,32 @@ models:
         description: >
           Поправка, добавленная к температуре прогноза Open-Meteo, чтобы привести его к станции
           (как при заполнении пропусков в core.fact_weather_daily)
+
+  - name: forecast_error
+    description: >
+      Прогнозы, день которых уже наступил, рядом с фактом: ошибка каждого прогноза.
+      По ней видно, как модели и Open-Meteo ошибаются на новых днях
+    columns:
+      - name: lead_days
+        description: Заблаговременность прогноза, сутки (0 — прогноз на день выпуска)
+      - name: forecast_temp
+        description: Прогноз среднесуточной температуры, °C (у Open-Meteo — с поправкой на станцию)
+      - name: actual_temp
+        description: Фактическая среднесуточная температура, °C
+      - name: error
+        description: Ошибка прогноза (прогноз − факт), °C
+      - name: threshold_correct
+        description: Прогноз и факт одинаково оказались выше или ниже порога отопления
+
+  - name: model_quality
+    description: Качество моделей прогноза по последней оценке (команда evaluate)
+    columns:
+      - name: split
+        description: validation — период подбора параметров, test — итоговая проверка
+      - name: horizon
+        description: На сколько суток вперёд от последнего известного дня
+      - name: mae
+        description: Средняя абсолютная ошибка, °C
+      - name: threshold_accuracy
+        description: Доля дней, где прогноз и факт одинаково попали выше или ниже порога отопления
+

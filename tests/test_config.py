@@ -62,6 +62,8 @@ def test_config_path_from_environment(tmp_path):
         ({"station__latitude": 155}, "latitude"),
         ({"history__start_date": "01.01.1991"}, "ГГГГ-ММ-ДД"),
         ({"project__timezone": "Moscow/Mars"}, "часовой пояс"),
+        ({"forecast__models": ["arima"]}, "неизвестные модели"),
+        ({"forecast__test_from": "2010-01-01"}, "validation_from < test_from"),
     ],
 )
 def test_invalid_values_rejected(tmp_path, overrides, message):

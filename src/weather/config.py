@@ -118,6 +118,15 @@ class ProcessingSettings:
 
 
 @dataclass(frozen=True)
+class ModelSettings:
+    """Модели прогноза и периоды для проверки их качества."""
+
+    codes: tuple[str, ...]
+    validation_from: date
+    test_from: date
+
+
+@dataclass(frozen=True)
 class Settings:
     db: DatabaseSettings
     station: StationSettings
@@ -130,6 +139,7 @@ class Settings:
     http: HttpSettings
     sources: SourcesSettings
     processing: ProcessingSettings
+    models: ModelSettings
     log_level: str
     config_path: Path
     # Полное содержимое YAML — для разделов, которые появятся на следующих этапах
@@ -154,12 +164,13 @@ def load_settings(
     if not path.is_absolute():
         path = PROJECT_ROOT / path
     data = _read_yaml(path)
+    history_start = _parse_date(_section(data, "history"), "start_date", "history")
 
     return Settings(
         db=_database_settings(environ),
         station=_station_settings(_section(data, "station")),
         timezone=_timezone(_section(data, "project")),
-        history_start=_parse_date(_section(data, "history"), "start_date", "history"),
+        history_start=history_start,
         forecast_target=str(_require(_section(data, "forecast"), "target", "forecast")),
         forecast_horizon_days=_int_in_range(_section(data, "forecast"), "horizon_days", "forecast", 1, 14),
         heating=_heating_rule(_section(_section(data, "decision_rules"), "heating")),
@@ -173,6 +184,7 @@ def load_settings(
         http=_http_settings(_section(data, "http")),
         sources=_sources_settings(_section(data, "sources")),
         processing=_processing_settings(_section(data, "processing")),
+        models=_model_settings(_section(data, "forecast"), history_start),
         log_level=_log_level(environ),
         config_path=path,
         raw=data,
@@ -394,3 +406,21 @@ def _processing_settings(section: Mapping[str, Any]) -> ProcessingSettings:
     if bias_from > bias_to:
         raise ConfigError(f"{where}: bias_period_from позже bias_period_to")
     return ProcessingSettings(norm_from, norm_to, bias_from, bias_to)
+
+
+MODEL_CODES = ("persistence", "climatology", "ridge", "lightgbm")
+
+
+def _model_settings(section: Mapping[str, Any], history_start: date) -> ModelSettings:
+    where = "forecast"
+    codes = _str_list(section, "models", where)
+    unknown = [c for c in codes if c not in MODEL_CODES]
+    if unknown:
+        raise ConfigError(
+            f"{where}.models: неизвестные модели {unknown}, допустимы: {', '.join(MODEL_CODES)}"
+        )
+    validation_from = _parse_date(section, "validation_from", where)
+    test_from = _parse_date(section, "test_from", where)
+    if not history_start < validation_from < test_from:
+        raise ConfigError(f"{where}: нужно history.start_date < validation_from < test_from")
+    return ModelSettings(codes, validation_from, test_from)

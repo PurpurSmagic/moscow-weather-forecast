@@ -13,9 +13,21 @@ sources:
         description: Годовые CSV-файлы Meteostat по станции 27612 (ВДНХ)
 
   - name: meta
-    description: Служебные таблицы загрузки
+    description: Служебные таблицы загрузки и моделей прогноза
     tables:
       - name: load_log
         description: Журнал загрузок по источникам
       - name: source_schema
         description: Реестр схем источников (какие поля приходили и когда)
+      - name: model_run
+        description: Запуски моделей прогноза — оценка качества (evaluate) и прогноз (forecast)
+      - name: model_metric
+        description: Метрики качества моделей по горизонтам на проверочном и тестовом периодах
+
+  # Прогнозы собственных моделей — пишет команда forecast (src/weather/forecast)
+  - name: forecast
+    schema: core
+    description: Прогнозы собственных моделей
+    tables:
+      - name: model_forecast
+        description: Прогнозы среднесуточной температуры моделями persistence, climatology, ridge, lightgbm
