@@ -172,6 +172,8 @@ def run_evaluate(settings: Settings, conn: Any) -> EvaluationResult:
     params = {
         "validation_from": m.validation_from.isoformat(),
         "test_from": m.test_from.isoformat(),
+        "bias_period_from": settings.processing.bias_period_from.isoformat(),
+        "bias_period_to": settings.processing.bias_period_to.isoformat(),
         "models": chosen,
         "importance": importance,
     }

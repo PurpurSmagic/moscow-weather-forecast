@@ -133,14 +133,22 @@ def cmd_run(settings: Settings, args: argparse.Namespace) -> int:
 
 
 def _evaluated(settings: Settings) -> bool:
-    """Была ли хотя бы одна успешная оценка качества моделей."""
+    """Соответствует ли последняя успешная оценка текущим периодам и моделям."""
     from weather import db
 
     with db.connect(settings.db, autocommit=True) as conn:
         row = conn.execute(
-            "SELECT 1 FROM meta.model_run WHERE kind = 'evaluate' AND status = 'success' LIMIT 1"
+            "SELECT params FROM meta.model_run WHERE kind = 'evaluate' AND status = 'success' "
+            "ORDER BY model_run_id DESC LIMIT 1"
         ).fetchone()
-    return row is not None
+    params = row[0] if row and row[0] else {}
+    return (
+        params.get("bias_period_from") == settings.processing.bias_period_from.isoformat()
+        and params.get("bias_period_to") == settings.processing.bias_period_to.isoformat()
+        and params.get("validation_from") == settings.models.validation_from.isoformat()
+        and params.get("test_from") == settings.models.test_from.isoformat()
+        and set(params.get("models", {})) == set(settings.models.codes)
+    )
 
 
 def cmd_transform(settings: Settings, args: argparse.Namespace) -> int:

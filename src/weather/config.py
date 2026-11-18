@@ -165,6 +165,10 @@ def load_settings(
         path = PROJECT_ROOT / path
     data = _read_yaml(path)
     history_start = _parse_date(_section(data, "history"), "start_date", "history")
+    processing = _processing_settings(_section(data, "processing"))
+    models = _model_settings(_section(data, "forecast"), history_start)
+    if processing.bias_period_to >= models.validation_from:
+        raise ConfigError("Период поправки станции должен закончиться до начала валидации")
 
     return Settings(
         db=_database_settings(environ),
@@ -183,8 +187,8 @@ def load_settings(
         ),
         http=_http_settings(_section(data, "http")),
         sources=_sources_settings(_section(data, "sources")),
-        processing=_processing_settings(_section(data, "processing")),
-        models=_model_settings(_section(data, "forecast"), history_start),
+        processing=processing,
+        models=models,
         log_level=_log_level(environ),
         config_path=path,
         raw=data,

@@ -12,7 +12,7 @@ pytest.importorskip("lightgbm", reason="lightgbm не установлен")
 
 from fakes import FakeHttp  # noqa: E402
 
-from weather.cli import FORECAST_MARTS  # noqa: E402
+from weather.cli import FORECAST_MARTS, _evaluated  # noqa: E402
 from weather.forecast.evaluate import evaluate_history, run_evaluate  # noqa: E402
 from weather.forecast.features import HISTORY_COLUMNS, climate_norm, horizon_data, make_features  # noqa: E402
 from weather.forecast.models import MODEL_NAMES  # noqa: E402
@@ -162,7 +162,12 @@ def test_evaluate_saves_metrics_and_forecast_uses_chosen_params(fresh_db):
     stored = params.fetchone()[0]
     stored = json.loads(stored) if isinstance(stored, str) else stored
     assert stored["test_from"] == "2016-01-01"
+    assert stored["bias_period_to"] == settings.processing.bias_period_to.isoformat()
     assert stored["models"]["ridge"] == result.params["ridge"]
+    assert _evaluated(settings)
 
     forecast = run_forecast(settings, conn)
     assert forecast.params_source == f"из оценки качества №{result.model_run_id}"
+    conn.execute("UPDATE meta.model_run SET params = params - 'bias_period_to' WHERE model_run_id = %s",
+                 (result.model_run_id,))
+    assert not _evaluated(settings)
