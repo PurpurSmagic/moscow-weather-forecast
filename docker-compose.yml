@@ -2,6 +2,22 @@
 # Значения ${...} берутся из файла .env (если его нет — используются значения по умолчанию).
 name: moscow-weather
 
+x-weather-service: &weather-service
+  build: .
+  environment:
+    POSTGRES_HOST: db
+    POSTGRES_PORT: "5432"
+    POSTGRES_DB: ${POSTGRES_DB:-weather}
+    POSTGRES_USER: ${POSTGRES_USER:-weather}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me}
+    WEATHER_CONFIG: ${WEATHER_CONFIG:-config/settings.yaml}
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  depends_on:
+    db:
+      condition: service_healthy
+  volumes:
+    - ./config:/app/config:ro
+
 services:
   db:
     image: postgres:16-alpine
@@ -28,23 +44,21 @@ services:
       retries: 20
 
   app:
-    build: .
+    <<: *weather-service
     image: moscow-weather-app:latest
-    environment:
-      POSTGRES_HOST: db
-      POSTGRES_PORT: "5432"
-      POSTGRES_DB: ${POSTGRES_DB:-weather}
-      POSTGRES_USER: ${POSTGRES_USER:-weather}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me}
-      WEATHER_CONFIG: ${WEATHER_CONFIG:-config/settings.yaml}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-    depends_on:
-      db:
-        condition: service_healthy
-    volumes:
-      # Настройки можно менять без пересборки образа
-      - ./config:/app/config:ro
     command: ["python", "-m", "weather", "run"]
+
+  dashboard:
+    <<: *weather-service
+    ports:
+      - "127.0.0.1:${DASHBOARD_PORT:-8501}:8501"
+    command: ["streamlit", "run", "src/weather/dashboard.py", "--server.address=0.0.0.0",
+              "--server.headless=true", "--browser.gatherUsageStats=false", "--theme.primaryColor=#227374"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
 
 volumes:
   pgdata:
